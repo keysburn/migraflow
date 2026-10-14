@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "migraflow"
+version = "0.1.0"
+description = "Safe, resumable file migration planning"
+requires-python = ">=3.12"
+dependencies = ["PyYAML>=6.0,<7", "rich>=13,<15"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+migraflow = "migraflow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,33 @@
+# Copy to migration.local.yml and edit the paths.
+# Relative paths are resolved from this configuration file's directory.
+source:
+  type: local
+  path: 'C:\data\source'
+
+destination:
+  type: local
+  path: 'C:\data\destination'
+
+# Must be on a local disk and outside both endpoint roots.
+state_dir: state
+
+# Content verification algorithm: sha256 (default) or md5.
+# run performs a full comparison; verify rechecks the saved transfer.
+verification:
+  algorithm: sha256
+
+# max_attempts includes the first attempt. Only transient transfer/read errors retry.
+retry:
+  max_attempts: 3
+  initial_delay_seconds: 1
+  max_delay_seconds: 30
+
+# Linux NAS example (not enabled):
+# source:
+#   type: mounted
+#   path: /mnt/source
+#   mount_source: nas-source:/export/data
+# destination:
+#   type: mounted
+#   path: /mnt/destination
+#   mount_source: nas-destination:/export/data
