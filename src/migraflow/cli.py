@@ -9,6 +9,7 @@ from rich.table import Table
 from .config import ConfigError, load_config
 from .planner import create_plan
 from .preflight import preflight, state_path
+from .progress import Dashboard
 from .state import database, summary
 from .transfer import execute
 from .verifier import VerificationError
@@ -34,6 +35,10 @@ def parser():
             sub.add_argument("--destination-type", choices=("local", "mounted"))
             if command in ("run", "resume", "verify"):
                 sub.add_argument("--job", required=True, help="Saved plan ID")
+                live = sub.add_mutually_exclusive_group()
+                live.add_argument("--live", dest="live", action="store_true", default=None,
+                                  help="Show live progress (automatic in interactive terminals)")
+                live.add_argument("--no-live", dest="live", action="store_false", help="Disable live progress")
             if command in ("run", "resume"):
                 sub.add_argument("--overwrite", action="store_true", help="Allow replacements after reviewing the plan and securing backups")
                 sub.add_argument("--allow-unprotected-source", action="store_true", help="Development tests only: source read-only protection is not enforced")
@@ -86,9 +91,16 @@ def main(argv=None):
         elif args.command == "preflight":
             result = preflight(config, test_destination_write=args.test_destination_write)
         elif args.command in ("run", "resume", "verify"):
-            result = execute(config, args.job, verify_only=args.command == "verify", resume=args.command == "resume",
-                             overwrite=getattr(args, "overwrite", False),
-                             allow_unprotected_source=getattr(args, "allow_unprotected_source", False))
+            console = Console(stderr=True)
+            if args.live and args.json:
+                raise ConfigError("--live and --json cannot be combined.")
+            if args.live and not console.is_terminal:
+                raise ConfigError("--live requires an interactive terminal; use --no-live for redirected output.")
+            enabled = not args.json and console.is_terminal and args.live is not False
+            with Dashboard(console, enabled) as observer:
+                result = execute(config, args.job, verify_only=args.command == "verify", resume=args.command == "resume",
+                                 overwrite=getattr(args, "overwrite", False),
+                                 allow_unprotected_source=getattr(args, "allow_unprotected_source", False), progress=observer)
         else:
             result = create_plan(config)
         display(result, args.json)

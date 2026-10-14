@@ -4,7 +4,7 @@
 
 확정 구성은 중계 인스턴스, Python CLI/CUI + Rich, rsync, SQLite WAL, 체크포인트·재개와 SHA-256이다. 아래 모듈·스키마·전송 배치·지원 OS는 요구사항을 구현하기 위한 제안이다.
 
-## 1.1. 현재 D1 및 로컬 전송·검증 구현
+## 1.1. 현재 D1 및 전송·검증 구현
 
 설정은 사용자 요청에 따라 YAML로 채택했다. TOML 제안은 폐기하고 PyYAML SafeLoader 기반 로딩과 argparse 옵션을 사용한다. 객체 생성 태그·중복 키·알 수 없는 키를 거부한다. 명령어 옵션이 파일보다 우선하며 환경변수/.env 치환은 아직 지원하지 않는다.
 
@@ -41,6 +41,26 @@ worker는 표준 라이브러리만 사용해 WSL에서도 별도 패키지 설�
 시도 전에도 완료 파일을 해시 확인해 재전송 후보에서 제외한다. 수동 resume은 새로운 시도 예산을 사용하며 누적 이력을 삭제하지 않는다. RETRY_WAIT 중 프로세스가 종료돼도 영속 결과를 기반으로 복구한다. 스캔 재개와 예약된 대기 시각의 정밀 복원은 아직 구현하지 않았다.
 
 목적지 쓰기 점검 결정(사용자 요청): 기본 preflight는 os.access(W_OK | X_OK)와 read_only_mount로 destination_write_permission을 반환한다. 실패는 경고로 보고해 읽기 전용 plan을 유지한다. 권한 조회가 실제 쓰기를 보장하지 않아 별도 CLI 옵션 --test-destination-write를 채택했으며 자동 실행과 YAML 저장은 제외했다. 옵션은 기존 안전 점검 후 양쪽 정체성을 재확인하고 읽기 전용 목적지 마운트를 거부한다. tempfile.mkstemp의 배타적 생성으로 기존 파일 덮어쓰기를 피하며 목적지 루트에 시험 데이터 기록·flush·fsync 후 닫고 finally에서 삭제한다. 생성/기록/동기화/삭제 실패는 ConfigError로 보고하며 삭제 실패 메시지에 경로를 포함한다. destination_write_test는 not_requested/passed다. 대상 디렉터리 mtime 변경과 강제 종료 시 임시 파일 잔류가 가능하다. 기존의 적대적인 경로 교체 경쟁 보호 한계는 동일하다.
+
+## 1.3. NAS 마운트 전송 구현
+
+Linux의 local/mounted 모든 조합은 기존 rsync adapter·상태·재개·검증 엔진을 사용한다. NAS 파일을 중계에 전체 사본으로 저장하지 않고 마운트 경로 사이에서 rsync가 스트리밍한다. mounted는 NFS/CIFS 등 네트워크 마운트로 판별되고 mount_source가 일치해야 한다. Windows Python은 local→local만 허용하고 NAS는 Linux/WSL 안의 Python으로 실행한다.
+
+/proc/self/mountinfo의 네트워크 마운트 record에 mount_id를 추가했다. mount ID·fs·source·root·point·options 및 endpoint device/inode를 계획에 저장하고 재개와 대조한다. 기존 local 계획의 mount record 형식은 유지한다. mount ID 없는 과거 mounted 계획과 remount된 경로는 새 계획이 필요하다. 동일 fs/source의 mounted 경로는 st_dev가 달라도 mount root 기준 물리 상대 경로의 중첩을 차단한다. 서로 다른 export/서버 이름의 실제 저장소 별칭은 자동 판별하지 않는다.
+
+mounted 배치에는 guard callback을 전달한다. worker READY 이후 START 전, 실행 중 약 0.2초마다, 종료 후 마운트 테이블을 검사한다. mountinfo 조회는 NAS 파일 stat를 사용하지 않는다. 변경 시 stdin lease를 닫아 worker가 rsync를 종료·회수하게 하고 ConfigError로 작업을 중지한다. 재시도 시작·해시 읽기 전후·파일 메타데이터 쓰기 전에도 검사한다. 폴링만으로 쓰기 대상을 보호할 수 없어 Linux worker가 양쪽 루트를 O_DIRECTORY/O_NOFOLLOW로 열고 pass_fds로 rsync에 전달하며 경로를 /proc/self/fd/N/로 고정한다. rsync가 열린 디렉터리를 사용하므로 마운트 해제 후 드러난 로컬 경로로 전환하지 않는다. 감시 종료 전에 FD와 worker lease를 해제하지 않는다.
+
+대상 read-only 마운트는 전송 전에 차단한다. 소스 read-only 보호·덮어쓰기·삭제 정책과 SHA-256/MD5의 전체 해시·세대·mtime 검증은 기존 계약을 유지한다. NAS의 mtime 정밀도가 계획 값과 다르면 검증 실패다. mount 유지 상태의 transient IO만 제한 재시도하며 마운트 변경은 자동 복구하지 않는다. OS의 hard NFS IO 등은 종료 신호에도 오래 차단될 수 있고 적대적인 동시 경로 교체의 완전한 보호는 아직 없다. 실제 NAS의 일관성과 권한·메타데이터 보장은 별도 시험이 필요하다.
+
+## 1.4. Rich 실시간 표시 구현
+
+progress 모듈은 ContextVar로 현재 실행의 선택적 observer를 연결한다. execute는 scope를 설정하고 상태 커밋·단계·처리·검증 커밋·재사용·오류 이벤트를 발행한다. verifier는 기존 1MiB 읽기 청크마다 해시 시작/바이트/종료 이벤트를 발행한다. observer 오류는 해당 실행의 표시 이벤트를 비활성화하고 전송 정책/상태 전이는 유지한다. KeyboardInterrupt는 삼키지 않아 기존 안전 중단 경로로 전달한다. DB 스키마나 설정 fingerprint는 바꾸지 않는다.
+
+Dashboard는 제한된 단일 상태와 RLock을 사용하며 Rich Live가 약 4회/초 화면을 갱신한다. 백그라운드 refresh는 파일/DB를 읽거나 정책을 실행하지 않고 메모리 상태만 렌더링한다. 검증 건수는 시작 시 저장된 summary에서 읽고 이후 커밋된 delta로 반영하며 화면 때문에 대량 SQL 집계를 반복하지 않는다. 단계 막대는 단계마다 초기화하고 파일 처리와 검증 성공/실패를 구분한다. 해시 속도는 현재 파일 읽기 기준, 단계 ETA는 처리 파일 평균 기준이다. 길고 특수한 경로는 Text로 출력하고 제어문자를 이스케이프한다.
+
+observer가 있을 때만 rsync에 --info=progress2,name0와 --outbuf=N을 추가한다. 기존 로그의 시작 offset 이후를 한 번에 최대 4096B 읽고 CR/LF 출력과 조각을 파싱한다. 보유 조각은 최대 4096B이며 알 수 없는 포맷/로그 읽기 오류는 무시한다. 진행 수치는 화면만 갱신하며 copied·VERIFIED 등 파일별 판정은 기존 세대·해시·DB 경로로만 수행한다. 프로세스 대기는 0.2초 간격이며 마운트 guard와 worker lease/정리 계약을 유지한다. rsync 수치의 분모/속도/시간은 rsync의 배치 추정이며 애플리케이션의 성공 증거 또는 네트워크 바이트가 아니다.
+
+CLI의 run/resume/verify는 stderr TTY에서 자동 Live를 사용한다. --no-live로 비활성화하며 --live는 TTY에서만 허용하고 --json과 충돌한다. JSON/리다이렉션에는 기존 출력·결과·종료 코드를 유지한다. Live 종료 후 기존 최종 summary를 표시한다. 현재는 실행 화면이며 status 감시·plan 스캔 화면·키보드 제어는 구현하지 않는다.
 
 ## 2. 중계 데이터 경로
 

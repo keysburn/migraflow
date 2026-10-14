@@ -22,9 +22,12 @@ def mounts():
     for line in Path("/proc/self/mountinfo").read_text().splitlines():
         left, right = line.split(" - ", 1)
         fields, extra = left.split(), right.split()
-        records.append({"point": _unescape(fields[4]), "root": _unescape(fields[3]),
+        record = {"point": _unescape(fields[4]), "root": _unescape(fields[3]),
                         "device": fields[2], "options": fields[5].split(","),
-                        "fs": extra[0], "source": _unescape(extra[1])})
+                        "fs": extra[0], "source": _unescape(extra[1])}
+        if record["fs"] in NETWORK_FS or record["fs"].startswith("fuse."):
+            record["mount_id"] = fields[0]
+        records.append(record)
     return records
 
 
@@ -129,7 +132,10 @@ def preflight(config, *, test_destination_write=False):
         for identity in (source, destination, state_identity):
             mount = identity["mount"]
             physical.append(Path(mount["root"]) / Path(identity["path"]).relative_to(mount["point"]))
-        if source["device"] == destination["device"] and (
+        same_share = (source["type"] == destination["type"] == "mounted"
+                      and source["mount"]["fs"] == destination["mount"]["fs"]
+                      and source["mount"]["source"] == destination["mount"]["source"])
+        if (source["device"] == destination["device"] or same_share) and (
                 _inside(physical[0], physical[1]) or _inside(physical[1], physical[0])):
             raise ConfigError("Source and destination overlap through bind mounts.")
         for index, identity in enumerate((source, destination)):

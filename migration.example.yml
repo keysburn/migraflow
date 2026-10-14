@@ -22,7 +22,9 @@ retry:
   initial_delay_seconds: 1
   max_delay_seconds: 30
 
-# Linux NAS example (not enabled):
+# Linux NAS example: replace the endpoints above; run Python inside Linux/WSL.
+# mount_source must match the Linux mount table (NFS nas:/export or CIFS //nas/share).
+# Source must be mounted read-only. Keep state_dir on Linux local disk, outside endpoints.
 # source:
 #   type: mounted
 #   path: /mnt/source

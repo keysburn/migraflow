@@ -10,17 +10,26 @@ from pathlib import Path
 from .config import ConfigError
 from .locking import file_lock
 from .preflight import _no_links, config_data, endpoint_identity, filesystem, preflight
+from .progress import emit, observing
 from .rsync_adapter import RsyncError, check_rsync, transfer_batch
 from .state import database, now, summary, writer_lock
 from .verifier import VerificationError, file_generation, hash_file
 
 
 def _identity(config, checked):
+    _mount_guard(config, checked)
     for label in ("source", "destination"):
         if endpoint_identity(getattr(config, label)) != checked[label]:
             raise ConfigError("Endpoint identity changed since planning.")
     if config.source.path.stat().st_mtime_ns != checked.get("source_root_mtime_ns"):
         raise VerificationError("Source root changed since planning. Create a new plan.")
+
+
+def _mount_guard(config, checked):
+    for label in ("source", "destination"):
+        endpoint = getattr(config, label)
+        if endpoint.type == "mounted" and filesystem(endpoint.path) != checked[label]["mount"]:
+            raise ConfigError("NAS mount disappeared or changed. Restore the planned mount before resuming; remounts require a new plan.")
 
 
 def _path(root, raw, mount):
@@ -74,6 +83,8 @@ def _load_plan(connection, plan_id, config, checked):
 def _status(connection, plan_id, value, error=None):
     connection.execute("UPDATE plans SET status=?, error=?, updated_at=? WHERE id=?", (value, error, now(), plan_id))
     connection.commit()
+    emit("status", status=value, error=error)
+    emit("checkpoint", time=now())
 
 
 def _record(connection, plan_id, raw):
@@ -94,10 +105,13 @@ def _target(config, row, checked, overwrite):
     return target
 
 
-def _hash_with_retry(connection, plan_id, config, path, expected=None):
+def _hash_with_retry(connection, plan_id, config, path, expected=None, *, checked):
     for attempt in range(1, config.retry.max_attempts + 1):
+        _mount_guard(config, checked)
         try:
-            return hash_file(path, config.hash_algorithm, expected)
+            result = hash_file(path, config.hash_algorithm, expected)
+            _mount_guard(config, checked)
+            return result
         except OSError as exc:
             if not _retryable(exc) or attempt == config.retry.max_attempts:
                 raise
@@ -105,6 +119,7 @@ def _hash_with_retry(connection, plan_id, config, path, expected=None):
             phase = connection.execute("SELECT status FROM plans WHERE id=?", (plan_id,)).fetchone()[0]
             connection.execute("""INSERT INTO attempts(plan_id,batch,attempt,created_at,outcome,error,delay_seconds)
                 VALUES(?,-1,?,?,'HASH_RETRY',?,?)""", (plan_id, attempt, now(), str(exc), delay))
+            emit("error", error=str(exc), retry=True)
             _status(connection, plan_id, "RETRY_WAIT", str(exc))
             time.sleep(delay)
             _status(connection, plan_id, phase)
@@ -118,10 +133,10 @@ def _hashes(connection, plan_id, config, row, recorded, checked, *, restore_time
     source = _path(config.source.path.resolve(), row["path"], checked["source"]["mount"])
     target = _target(config, row, checked, True)
     if source_hash is None:
-        source_hash, _ = _hash_with_retry(connection, plan_id, config, source, expected)
+        source_hash, _ = _hash_with_retry(connection, plan_id, config, source, expected, checked=checked)
     if recorded["source_hash"] and source_hash != recorded["source_hash"]:
         raise VerificationError("Source content changed. Create a new plan.")
-    destination_hash, destination_generation = _hash_with_retry(connection, plan_id, config, target)
+    destination_hash, destination_generation = _hash_with_retry(connection, plan_id, config, target, checked=checked)
     if file_generation(source) != expected or file_generation(target) != destination_generation:
         raise VerificationError("File changed during verification.")
     if source_hash != destination_hash:
@@ -142,7 +157,10 @@ def _save_verified(connection, plan_id, row, hashes):
 
 def _verify_batch(connection, plan_id, config, checked, batch):
     failures = 0
+    verified_delta = 0
     for row in batch:
+        _mount_guard(config, checked)
+        recorded = _record(connection, plan_id, row["path"]) if row["kind"] == "file" else None
         try:
             _planned_source(config, row, checked)
             target = _path(config.destination.path.resolve(), row["path"], checked["destination"]["mount"])
@@ -151,24 +169,33 @@ def _verify_batch(connection, plan_id, config, checked, batch):
                     raise VerificationError(f"Destination directory metadata differs: {target}")
                 connection.execute("DELETE FROM file_results WHERE plan_id=? AND path=?", (plan_id, row["path"]))
                 continue
-            recorded = _record(connection, plan_id, row["path"])
             if recorded is None:
                 raise VerificationError("No transfer generation exists for this file.")
             hashes = _hashes(connection, plan_id, config, row, recorded, checked)
             _save_verified(connection, plan_id, row, hashes)
+            verified_delta += recorded["status"] != "VERIFIED"
+            emit("processed", files=1, bytes=row["size"], successes=1)
         except (OSError, ConfigError, VerificationError) as exc:
             failures += 1
+            emit("error", error=str(exc))
+            if row["kind"] == "file":
+                verified_delta -= recorded is not None and recorded["status"] == "VERIFIED"
+                emit("processed", files=1, bytes=row["size"], failures=1)
             connection.execute("""INSERT INTO file_results(plan_id,path,status,algorithm,source_generation,error)
                 VALUES(?,?,'VERIFY_FAILED',?,'null',?) ON CONFLICT(plan_id,path)
                 DO UPDATE SET status='VERIFY_FAILED',error=excluded.error""",
                 (plan_id, row["path"], config.hash_algorithm, str(exc)))
     connection.execute("UPDATE plans SET updated_at=? WHERE id=?", (now(), plan_id))
     connection.commit()
+    emit("checkpoint", delta=verified_delta, time=now())
     return failures
 
 
 def _verify(connection, plan_id, config, checked):
     _status(connection, plan_id, "VERIFYING")
+    totals = connection.execute("SELECT COUNT(*), COALESCE(SUM(size),0) FROM entries WHERE plan_id=? AND kind='file'",
+                                (plan_id,)).fetchone()
+    emit("phase", phase="전체 내용 검증", total_files=totals[0], total_bytes=totals[1])
     failures = 0
     for batch in _rows(connection, plan_id):
         _identity(config, checked)
@@ -180,7 +207,9 @@ def _verify(connection, plan_id, config, checked):
 def _recover_batch(connection, plan_id, config, checked, batch, overwrite):
     pending = []
     reused = 0
+    verified_delta = 0
     for row in batch:
+        _mount_guard(config, checked)
         identity = _planned_source(config, row, checked)
         if row["kind"] == "directory":
             target = _target(config, row, checked, overwrite)
@@ -196,7 +225,7 @@ def _recover_batch(connection, plan_id, config, checked, batch, overwrite):
             source_hash = None
             if recorded["source_hash"]:
                 source_hash, _ = _hash_with_retry(connection, plan_id, config,
-                    config.source.path.resolve() / os.fsdecode(row["path"]), identity)
+                    config.source.path.resolve() / os.fsdecode(row["path"]), identity, checked=checked)
                 if source_hash != recorded["source_hash"]:
                     raise VerificationError("Source content changed. Create a new plan.")
             if target.exists():
@@ -207,14 +236,17 @@ def _recover_batch(connection, plan_id, config, checked, batch, overwrite):
                     _target(config, row, checked, overwrite or bool(recorded["copied"]))
                 else:
                     _save_verified(connection, plan_id, row, hashes)
+                    verified_delta += recorded["status"] != "VERIFIED"
                     reused += 1
                     continue
         _target(config, row, checked, overwrite or (recorded is not None and bool(recorded["copied"])))
+        verified_delta -= recorded is not None and recorded["status"] == "VERIFIED"
         connection.execute("""INSERT INTO file_results(plan_id,path,status,algorithm,source_generation)
             VALUES(?,?,'QUEUED',?,?) ON CONFLICT(plan_id,path) DO UPDATE SET status='QUEUED',error=NULL""",
             (plan_id, row["path"], config.hash_algorithm, json.dumps(identity)))
         pending.append(row)
     connection.commit()
+    emit("checkpoint", delta=verified_delta, time=now())
     return pending, reused
 
 
@@ -247,9 +279,15 @@ def _transfer_with_retry(connection, plan_id, config, checked, batch, batch_id,
     pending = batch
     for attempt in range(1, policy.max_attempts + 1):
         _identity(config, checked)
+        emit("phase", phase=f"배치 {batch_id} · 전송 전 점검 (시도 {attempt})",
+             total_files=sum(row["kind"] == "file" for row in pending),
+             total_bytes=sum(row["size"] for row in pending))
         pending, _ = _recover_batch(connection, plan_id, config, checked, pending, overwrite)
         if not pending:
             return
+        emit("phase", phase=f"배치 {batch_id} · rsync 전송 (시도 {attempt})",
+             total_files=sum(row["kind"] == "file" for row in pending),
+             total_bytes=sum(row["size"] for row in pending))
         for row in pending:
             _partial_paths(config, checked, row, partial_name)
             if row["kind"] == "file":
@@ -257,22 +295,27 @@ def _transfer_with_retry(connection, plan_id, config, checked, batch, batch_id,
                                    (plan_id, row["path"]))
         connection.commit()
         try:
+            mounted = config.source.type == "mounted" or config.destination.type == "mounted"
             transfer_batch(prefix, config.source.path.resolve(), config.destination.path.resolve(),
                            [row["path"] for row in pending], manifest, log,
-                           overwrite=overwrite, partial_dir=partial_name)
+                           overwrite=overwrite, partial_dir=partial_name,
+                           **({"guard": lambda: _mount_guard(config, checked), "pin_roots": True} if mounted else {}))
         except OSError as exc:
             delay = min(policy.initial_delay_seconds * 2 ** (attempt - 1), policy.max_delay_seconds)
             again = _retryable(exc) and attempt < policy.max_attempts
             connection.execute("""INSERT INTO attempts(plan_id,batch,attempt,created_at,outcome,error,delay_seconds)
                 VALUES(?,?,?,?,?,?,?)""",
                 (plan_id, batch_id, attempt, now(), "RETRY" if again else "FAILED", str(exc), delay if again else 0))
+            emit("error", error=str(exc), retry=again)
             _status(connection, plan_id, "RETRY_WAIT" if again else "FAILED", str(exc))
             if not again:
                 raise
             time.sleep(delay)
             _status(connection, plan_id, "RUNNING")
             continue
+        _identity(config, checked)
         for row in pending:
+            _mount_guard(config, checked)
             _planned_source(config, row, checked)
             if row["kind"] == "file":
                 target = _target(config, row, checked, True)
@@ -283,7 +326,11 @@ def _transfer_with_retry(connection, plan_id, config, checked, batch, batch_id,
         connection.execute("""INSERT INTO attempts(plan_id,batch,attempt,created_at,outcome)
             VALUES(?,?,?,?,'SUCCESS')""", (plan_id, batch_id, attempt, now()))
         connection.commit()
-        if _verify_batch(connection, plan_id, config, checked, [row for row in pending if row["kind"] == "file"]):
+        files = [row for row in pending if row["kind"] == "file"]
+        emit("processed", files=len(files), bytes=sum(row["size"] for row in files))
+        emit("phase", phase=f"배치 {batch_id} · 내용 검증", total_files=len(files),
+             total_bytes=sum(row["size"] for row in files))
+        if _verify_batch(connection, plan_id, config, checked, files):
             raise VerificationError("Batch content verification failed.")
         return
 
@@ -308,9 +355,14 @@ def _idle_worker(state):
             time.sleep(0.1)
 
 
-def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False, allow_unprotected_source=False):
-    if config.source.type != "local" or config.destination.type != "local":
-        raise ConfigError("This transfer release supports local-to-local only.")
+def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False, allow_unprotected_source=False,
+            progress=None):
+    with observing(progress):
+        return _execute(config, plan_id, verify_only=verify_only, resume=resume, overwrite=overwrite,
+                        allow_unprotected_source=allow_unprotected_source)
+
+
+def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False, allow_unprotected_source=False):
     checked = preflight(config)
     state = Path(checked["state_dir"])
     _check_state_files(state)
@@ -327,6 +379,7 @@ def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False
                 raise
             connection.execute("UPDATE file_results SET status='UNVERIFIED', source_hash=NULL, destination_hash=NULL WHERE plan_id=?", (plan_id,))
             _status(connection, plan_id, "VERIFY_FAILED", str(exc))
+            emit("checkpoint", verified=0)
             return summary(connection, plan_id)
         allowed = ("TRANSFER_COMPLETE", "VERIFIED", "VERIFY_FAILED") if verify_only else (
             "PLANNED", "RUNNING", "RECOVERING", "RETRY_WAIT", "TRANSFER_COMPLETE", "VERIFYING",
@@ -334,19 +387,29 @@ def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False
         if planned["status"] not in allowed:
             raise ConfigError(f"Cannot execute plan in state {planned['status']}.")
         options = planned["preflight"].get("execution_options", {})
+        emit("init", job=plan_id, status=planned["status"], retries=planned["retry_count"],
+             planned_files=planned["files"], planned_bytes=planned["bytes"], verified=planned["verified_files"],
+             source=str(config.source.path), destination=str(config.destination.path), algorithm=config.hash_algorithm,
+             checkpoint=planned["updated_at"])
         if resume and options and not options.get("supervisor_version") and planned["status"] in (
                 "RUNNING", "FAILED", "INTERRUPTED", "VERIFYING"):
             raise ConfigError("Legacy interrupted transfer has no worker lease. Confirm old processes exited and create a new plan.")
         overwrite = overwrite or (resume and options.get("overwrite", False))
         if not verify_only:
+            if checked["destination"]["read_only_mount"]:
+                raise ConfigError("Destination mount is read-only.")
             if not checked["source"]["read_only_mount"] and not allow_unprotected_source:
                 raise ConfigError("Source read-only protection is unproven. For isolated development tests use --allow-unprotected-source.")
             prefix = check_rsync()
+            emit("phase", phase="전송 전 경로·세대 점검", total_files=planned["files"], total_bytes=planned["bytes"])
             for batch in _rows(connection, plan_id):
                 for row in batch:
+                    _mount_guard(config, checked)
                     _planned_source(config, row, checked)
                     if not resume:
                         _target(config, row, checked, overwrite)
+                emit("processed", files=sum(row["kind"] == "file" for row in batch),
+                     bytes=sum(row["size"] for row in batch))
             if not resume and checked["destination_free_bytes"] < planned["bytes"]:
                 raise ConfigError("Insufficient destination space for temporary transfer files.")
         try:
@@ -369,11 +432,15 @@ def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False
                     raise ConfigError("Transfer scratch files must not be hardlinks.")
             partial_name = ".migraflow-partial-" + plan_id
             if resume:
+                emit("phase", phase="재개 점검 · 양측 해시 재확인", total_files=planned["files"], total_bytes=planned["bytes"])
                 needed = 0
                 for batch in _rows(connection, plan_id):
                     _identity(config, checked)
                     pending, reused = _recover_batch(connection, plan_id, config, checked, batch, overwrite)
                     options["reused_files"] += reused
+                    emit("reuse", files=reused)
+                    emit("processed", files=sum(row["kind"] == "file" for row in batch),
+                         bytes=sum(row["size"] for row in batch))
                     needed += sum(row["size"] for row in pending if row["kind"] == "file")
                     connection.execute("UPDATE plans SET preflight=? WHERE id=?", (json.dumps(planned["preflight"]), plan_id))
                     connection.commit()
@@ -402,6 +469,7 @@ def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False
                     if group:
                         _transfer_with_retry(connection, plan_id, config, checked, group, batch_id,
                                              prefix, manifest, log, replace, partial_name)
+            emit("phase", phase="디렉터리 메타데이터 확인", total_files=None, total_bytes=0)
             for batch in _rows(connection, plan_id, directories=True):
                 _identity(config, checked)
                 for row in batch:
@@ -422,4 +490,6 @@ def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False
             if isinstance(exc, VerificationError):
                 connection.execute("UPDATE file_results SET status='UNVERIFIED' WHERE plan_id=? AND status='VERIFIED'", (plan_id,))
             _status(connection, plan_id, "VERIFY_FAILED" if isinstance(exc, VerificationError) else "FAILED", str(exc))
+            if isinstance(exc, VerificationError):
+                emit("checkpoint", verified=0)
         return summary(connection, plan_id)

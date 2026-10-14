@@ -4,9 +4,9 @@
 
 프로젝트 경로: `C:\Users\Coreit\Documents\Projects\migraflow`
 
-D1과 로컬→로컬 전송·내용 검증을 구현했다. preflight/plan/status/run/resume/verify가 실행 가능하다. run은 rsync 전송 후 전체 SHA-256/MD5 비교를 자동 수행한다. 로컬 전송 재개와 제한 자동 재시도는 구현했으며 NAS 전송, 스캔 재개, 새 회차 sync/cutover와 실시간 CUI는 미구현이다.
+D1과 local/mounted 양쪽 조합의 전송·내용 검증을 구현했다. preflight/plan/status/run/resume/verify가 실행 가능하다. run은 rsync 전송 후 전체 SHA-256/MD5 비교를 자동 수행한다. 전송 재개·제한 자동 재시도와 실행 중 Rich 실시간 화면을 지원하며 스캔 재개, 새 회차 sync/cutover는 미구현이다.
 
-Windows Python 3.12 + WSL rsync 및 Ubuntu Python 3.14 직접 실행의 실제 로컬 전송을 검사했다. mounted 조합은 계획 기능의 모의 Linux 마운트 시험으로만 검증했다. 실제 NAS와 대규모 성능 시험은 아직 통과하지 않았다. 소스 보호는 사전 점검 결과에 표시하지만 전송 준비 완료를 선언하지 않는다. source/destination는 기존 디렉터리만 지원한다.
+Windows Python 3.12 + WSL rsync 및 Ubuntu Python 3.14 직접 실행의 실제 로컬 전송을 검사했다. mounted 조합은 모의 Linux 마운트 정체성과 실제 rsync로 전송·재개·양측 해시·변조 복구를 검사했다. 실제 NAS와 대규모 성능 시험은 아직 통과하지 않았다. 소스 보호는 사전 점검 결과에 표시하지만 전송 준비 완료를 선언하지 않는다. source/destination는 기존 디렉터리만 지원한다.
 
 첫 작업은 양쪽 endpoint의 local/원격 타입과 환경 확인 및 읽기 전용 사전 점검이다. NFS/SMB 중 어떤 마운트를 사용할지는 실제 NAS가 지원하는 기능과 메타데이터 요구에 따라 정한다. 운영 NAS 전송·삭제·서비스 전환을 “개발 시작”의 일부로 자동 실행하지 않는다.
 
@@ -27,7 +27,7 @@ CLI 파서는 argparse, 설정은 사용자 요청에 따라 YAML로 채택했�
 
 테스트 의존성은 pytest이며 설치 명령은 README를 따른다. 검사 환경은 PyYAML 6.0.3, Rich 14.3.4, pytest 9.1.1이다.
 
-전체 목표 디렉터리(현재는 config.py, preflight.py, planner.py, state.py, cli.py, transfer.py, rsync_adapter.py, verifier.py, locking.py, worker.py와 tests/test_planning.py, tests/test_transfer.py, tests/test_resume.py; 나머지는 향후 제안):
+전체 목표 디렉터리(현재는 config.py, preflight.py, planner.py, state.py, cli.py, transfer.py, rsync_adapter.py, verifier.py, locking.py, worker.py, progress.py와 tests/test_planning.py, tests/test_transfer.py, tests/test_resume.py, tests/test_mounted.py, tests/test_progress.py; 나머지는 향후 제안):
 ~~~text
 migraflow/
   README.md
@@ -91,7 +91,7 @@ plan은 메타데이터만 조사하며 읽기 권한·호환성의 모든 문�
 
 운영 전송은 read-only 소스 마운트를 요구한다. 격리된 개발 데이터만 --allow-unprotected-source로 예외를 허용한다. 대상 기존 파일에는 --overwrite가 필요하며 사용자가 계획과 복구 가능한 백업을 확인하는 의미다. 옵션과 rsync 호출은 preflight.execution_options에 기록한다. 자동 백업은 하지 않는다.
 
-현재 전송은 local→local만 지원한다. Linux/WSL 환경의 rsync가 필요하다. Windows는 기본 WSL 배포판과 wslpath를 사용한다. batch timeout은 1800초다. 전송 중단 후 같은 계획 ID의 resume과 부분 파일 재개를 지원하며 감시 프로세스가 잔여 rsync 종료를 확인한다. 최초 전송은 계획 파일 크기 합계, 재개는 남은 파일 크기 합계 이상의 대상 여유 공간을 요구하는 보수적인 검사다.
+현재 Linux Python 전송은 local/mounted 양쪽 조합을 지원한다. Windows Python은 local→local만 지원하고 기본 WSL 배포판과 wslpath를 사용한다. batch timeout은 1800초다. 전송 중단 후 같은 계획 ID의 resume과 부분 파일 재개를 지원하며 감시 프로세스가 잔여 rsync 종료를 확인한다. 최초 전송은 계획 파일 크기 합계, 재개는 남은 파일 크기 합계 이상의 대상 여유 공간을 요구하는 보수적인 검사다.
 
 ## 3.3. D3 복구·재시도 검증
 
@@ -105,7 +105,27 @@ plan은 메타데이터만 조사하며 읽기 권한·호환성의 모든 문�
 
 감시 프로세스는 부모 EOF에 따라 종료·회수하고 worker.lock이 유지된 동안 다른 전송을 차단한다. WSL 응답이 없거나 감시 장치 자체를 별도로 강제 종료한 경우에는 프로세스 상태를 확인해야 한다. v2 이전 감시 lease 없는 비정상 종료 작업은 자동 안전 판정을 할 수 없어 재개를 거부한다. 스캔 재개와 NAS 단절·전원 장애 환경은 후속 검증이다.
 
+## 3.4. NAS 마운트 개발·운영 검증
+
+2026-10-14: Linux 최종 전체 검사 149 passed(mounted 검사 27개 포함). Windows+WSL 전체 검사 132 passed, 16 skipped였으며 Linux 전용 루트 고정 시험을 추가한 후 Windows mounted 검사만 다시 실행해 12 passed, 15 skipped를 확인했다. skip은 Linux 전용 mounted 실행과 기존 symlink 권한/POSIX 파일명 제한에 해당한다. 의존성 검사·컴파일·git diff --check도 통과했다.
+
+세 방향×NFS/CIFS 모의 마운트×SHA-256/MD5에서 실제 rsync로 전송 후 DB 커밋 전 중단·재개·재복사 방지·양측 해시 저장·변조 탐지/복구·소스 무변경을 확인했다. 실행 전 mount 누락/다른 공유/remount/ro 변경, 중첩 공유의 서로 다른 device, 재시도 대기 중 마운트 해제, 해시 읽기 중 mount ID 변경을 차단했다. 실제 rsync를 테스트에서만 속도 제한해 전송 중 모의 마운트를 바꾸고 rsync 종료·worker lease 해제와 원래 마운트 정체성 복원 후 재개를 확인했다. worker가 루트를 연 다음 목적지 디렉터리를 교체한 시험에서 원래 디렉터리에만 복사하고 새 빈 로컬 디렉터리에는 쓰지 않았다. 실제 NAS 서버나 마운트 해제 시스템 호출은 사용하지 않았다.
+
+운영 시험은 Linux Python 3.12 이상과 rsync를 설치한 중계에서 수행한다. OS에서 소스를 read-only, 대상을 read-write로 마운트하고 전용 테스트 경로를 만든다. YAML의 mount_source는 /proc/self/mountinfo의 source와 일치시킨다. SQLite state_dir는 양쪽 경로 밖의 Linux 로컬 디스크에 둔다. CLI 명령과 NAS YAML은 README의 NAS 마운트 절차를 따른다. 기존 대상은 계획·백업 확인 후 --overwrite가 필요하다.
+
+작은 대표 트리에서 source 내용/mtime/모드의 전후 비교, 양측 선택 해시 일치, 동일 크기/mtime 변조 탐지, Ctrl+C와 강제 종료 후 같은 ID 재개를 확인한다. 실제 네트워크 연결 단절도 시험하되 마운트 유지/해제 여부를 구분한다. mount 유지+원본 동일은 resume, remount는 새 plan이다. NFS hard IO의 차단·SMB inode 안정성·mtime 정밀도·NAS rename/flush/권한은 실제 장비에서 확인한다. 실패 파일이 있으면 VERIFIED 또는 운영 준비로 보고하지 않는다. 마운트 해제/다른 공유로 재연결한 경우 노출된 로컬 디렉터리에 새 파일이 생기지 않는지 확인한다.
+
+## 3.5. Rich 실시간 화면 검증
+
+2026-10-14: 실시간 화면/rsync 진행 표시 추가 후 Linux 전체 검사 165 passed, Windows+WSL 전체 검사 148 passed, 17 skipped. 이후 CP949 표시 보완과 실제 Live CLI 결합 시험을 추가했고 최종 화면 전용 검사는 Linux 및 Windows+WSL에서 각각 20 passed다. 컴파일·의존성 검사·git diff --check를 확인했다.
+
+두 해시 알고리즘에서 표시 이벤트와 실제 파일·DB 결과를 대조하고 재개 시 재복사 없음, 재시도·변조 실패 건수, Ctrl+C의 INTERRUPTED 상태, 표시 observer/출력 오류로 인한 전송 방해 방지를 검사했다. 실제 rsync를 시험에서만 속도 제한해 배치 완료 전 바이트/백분율이 표시되고 그 시점에는 VERIFIED 파일이 없는 것을 확인했다. 로그 조각·CR/LF·알 수 없는 행·읽기 오류와 4096B 상한을 검사했다. JSON 단일 결과, 리다이렉션 비활성화, TTY 자동/명시 활성화와 --no-live, 잘못된 --live 조합, 좁은 화면·제어문자·literal markup·CP949/비ASCII 파일명 표시를 검사했다. 실제 CLI run/verify를 Rich Live에 연결해 복사·재검증 성공을 확인했다.
+
+현재 화면은 D5의 실행 중 표시 기능이다. 별도 status 감시 화면·스캔 진행 화면·키보드 메뉴·최근 구간 처리량·실제 네트워크 바이트·NAS 부하·DB 크기·여유 공간의 실시간 추적은 후속 범위다. 실제 NAS 성능이나 모든 터미널 렌더링을 검증 완료로 해석하지 않는다.
+
 ## 4. CLI 계약(현재와 향후)
+
+run/resume/verify에 --live/--no-live를 추가했다. stderr가 TTY이면 자동으로 실시간 화면을 표시하고 JSON/리다이렉션은 끈다. --live+--json 또는 비대화형 --live는 종료 코드 2다. Ctrl+C는 작업을 중단하고 worker를 종료·회수한 뒤 INTERRUPTED를 기록하며 resume으로 이어간다. 별도 관찰만 종료하는 키는 없다. 상세 사용법과 지표의 의미·제한은 README의 Rich 실시간 화면을 따른다.
 
 2026-10-14 목적지 쓰기 점검 검증: Windows Python에서 계획/사전 점검 검사 68 passed, 1 skipped, 전체 검사 120 passed, 2 skipped. 기본 실행의 무쓰기, 권한 조회 실패 시 plan 유지, 임시 파일 실제 기록·동기화·삭제, 소스 및 기존 파일 보존, 생성/기록/flush/fsync 실패·일반 중단 시 정리, 삭제 실패 경로 보고, 경로 중첩·정체성 변경·읽기 전용/누락 마운트 차단을 확인했다. 기본 임시 폴더 접근 권한 문제로 work 아래 테스트 경로를 사용했다. 앞선 전체 검사에서 WSL rsync --version 시간 초과 1건이 있었으나 최종 전체 검사에서는 재현되지 않았다. 실제 NAS 쓰기 권한·Linux 실제 마운트 시험은 이 작업에서 수행하지 않았다.
 
@@ -178,4 +198,4 @@ DB 인덱스와 경로 길이 때문에 1000만 행의 상태 DB가 작다고 �
 
 ## 8. 다음 개발 세션 인계문
 
-“이 저장소의 README.md, AGENTS.md와 docs 세 문서를 읽고 MigraFlow 개발을 이어간다. 문서의 확정 사항과 제안을 구분한다. 현재 D1 계획 및 로컬 run/verify 구현과 테스트를 확인하고, 로컬 D3의 중단·재개·제한 재시도 구현을 확인하고 NAS 지원·새 회차 증분 동기화·규모 검증의 진입 조건을 정한다. 구현 전에 가정과 검증 기준을 설명하고 실제 운영 데이터 전송·삭제·cutover는 수행하지 않는다. 완료 시 변경, 검사 결과, 다음 단계의 조건을 보고한다.”
+“이 저장소의 README.md, AGENTS.md와 docs 세 문서를 읽고 MigraFlow 개발을 이어간다. 문서의 확정 사항과 제안을 구분한다. 현재 D1 계획 및 local/mounted run/resume/verify 구현과 테스트를 확인하고 실제 NAS 검증·새 회차 증분 동기화·규모 검증의 진입 조건을 정한다. 구현 전에 가정과 검증 기준을 설명하고 실제 운영 데이터 전송·삭제·cutover는 수행하지 않는다. 완료 시 변경, 검사 결과, 다음 단계의 조건을 보고한다.”

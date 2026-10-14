@@ -5,7 +5,7 @@ import signal
 import subprocess
 import sys
 import threading
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 from locking import file_lock
@@ -16,19 +16,28 @@ def main():
     parser.add_argument("--lock")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--forward-lease", action="store_true")
+    parser.add_argument("--pin-roots", action="store_true")
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
-        with file_lock(Path(args.lock)) if args.lock else nullcontext():
+        with (file_lock(Path(args.lock)) if args.lock else nullcontext()), ExitStack() as roots:
+            descriptors = []
+            if args.pin_roots:
+                for index in (-2, -1):
+                    fd = os.open(command[index], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    roots.callback(os.close, fd)
+                    descriptors.append(fd)
+                    command[index] = f"/proc/self/fd/{fd}/"
             print("READY", flush=True)
             if os.read(sys.stdin.fileno(), 1) != b"1":
                 return 20
             with Path(args.manifest).open("rb") as manifest:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE if args.forward_lease else manifest,
                                            stdout=subprocess.PIPE if args.forward_lease else sys.stderr,
-                                           stderr=sys.stderr, start_new_session=os.name != "nt")
+                                           stderr=sys.stderr, start_new_session=os.name != "nt",
+                                           pass_fds=tuple(descriptors))
                 stopped = threading.Event()
                 stop_lock = threading.Lock()
 

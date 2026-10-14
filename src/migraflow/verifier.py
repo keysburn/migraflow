@@ -4,6 +4,7 @@ import stat
 
 from .config import ConfigError
 from .preflight import _no_links
+from .progress import emit
 
 
 class VerificationError(ValueError):
@@ -27,6 +28,7 @@ def hash_file(path, algorithm, expected=None):
     identity = file_generation(path)
     if expected is not None and identity != expected:
         raise VerificationError(f"Source generation changed: {path}")
+    emit("hash_start", path=path, size=identity[2])
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     with os.fdopen(os.open(path, flags), "rb") as handle:
         before = os.fstat(handle.fileno())
@@ -44,6 +46,8 @@ def hash_file(path, algorithm, expected=None):
             raise ConfigError(f"Hash algorithm unavailable in this Python build: {algorithm}") from exc
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
+            emit("hash_chunk", bytes=len(chunk))
         if generation(os.fstat(handle.fileno())) != handle_identity or file_generation(path) != identity:
             raise VerificationError(f"File changed while hashing: {path}")
+    emit("hash_end")
     return digest.hexdigest(), identity
