@@ -1,5 +1,6 @@
 """Ephemeral display events; never a source of transfer or checkpoint state."""
 import time
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import RLock
@@ -74,6 +75,8 @@ class Dashboard:
                      "hash_active": False, "note": "Ctrl+C: 체크포인트를 남기고 중지"}
         self.data["rsync"] = None
         self.live = None
+        self.samples = deque(maxlen=64)
+        self.samples.append((self.started, 0))
 
     def __enter__(self):
         if self.enabled:
@@ -100,11 +103,38 @@ class Dashboard:
                 state.update(values, files=0, bytes=0, successes=0, failures=0,
                              phase_started=time.monotonic(), hash_active=False, current="-", rsync=None,
                              hash_total=None, hash_bytes=0)
+                self.samples.clear()
+                self.samples.append((time.monotonic(), 0))
             elif kind == "processed":
                 state["files"] += values.get("files", 0)
                 state["bytes"] += values.get("bytes", 0)
                 state["successes"] += values.get("successes", 0)
                 state["failures"] += values.get("failures", 0)
+                stamp = time.monotonic()
+                if stamp - self.samples[-1][0] >= 0.5:
+                    self.samples.append((stamp, state["files"]))
+                while len(self.samples) > 1 and self.samples[1][0] < stamp - 10:
+                    self.samples.popleft()
+            elif kind == "watch":
+                result = values["result"]
+                previous = state["files"]
+                state.update(job=result["id"], status=result["status"], phase="DB 상태 감시", files=result["verified_files"],
+                             verified=result["verified_files"], planned_files=result["files"], total_files=result["files"],
+                             planned_bytes=result["bytes"], total_bytes=result["bytes"], retries=result["retry_count"],
+                             reused=result["reused_files"], algorithm=result["hash_algorithm"], checkpoint=result["updated_at"],
+                             successes=result["verified_files"], failures=result.get("file_statuses", {}).get("VERIFY_FAILED", 0),
+                             errors=max(result.get("file_statuses", {}).get("VERIFY_FAILED", 0), int(bool(result.get("error")))),
+                             source=result["config"]["source"]["path"], destination=result["config"]["destination"]["path"],
+                             database_bytes=values["database_bytes"], state_free_bytes=values["state_free_bytes"],
+                             note="Ctrl+C: 감시만 종료 · 실행 중인 작업은 계속됩니다")
+                if not state.get("watching") or state["files"] < previous:
+                    state["watch_start_files"] = state["files"]
+                    state["phase_started"] = time.monotonic()
+                    self.samples.clear()
+                    self.samples.append((time.monotonic(), state["files"]))
+                    state["watching"] = True
+                elif time.monotonic() - self.samples[-1][0] >= 0.5:
+                    self.samples.append((time.monotonic(), state["files"]))
             elif kind == "hash_start":
                 state.update(current=_safe(values["path"]), hash_total=values["size"],
                              hash_bytes=0, hash_started=time.monotonic(), hash_active=True)
@@ -139,11 +169,15 @@ class Dashboard:
     def __rich_console__(self, console, options):
         with self.lock:
             state = self.data.copy()
+            samples = tuple(self.samples)
         now = time.monotonic()
         elapsed = now - state["phase_started"]
-        rate = state["files"] / elapsed if elapsed > 0 and state["files"] else None
+        measured_files = state["files"] - state.get("watch_start_files", 0)
+        rate = measured_files / elapsed if elapsed > 0 and measured_files > 0 else None
         remaining = max(0, (state["total_files"] or 0) - state["files"])
         eta = remaining / rate if rate and state["status"] not in ("RETRY_WAIT", "FAILED", "INTERRUPTED") else None
+        sample = next((item for item in samples if item[0] >= now - 10), samples[-1])
+        recent = max(0, state["files"] - sample[1]) / max(now - sample[0], 0.001) if now - sample[0] <= 10 else 0
         progress = Progress(TextColumn("{task.description}"), BarColumn(), TaskProgressColumn(),
                             console=console, auto_refresh=False)
         progress.add_task("검증 체크포인트", total=state["planned_files"], completed=state["verified"])
@@ -160,8 +194,11 @@ class Dashboard:
             ("경로", f"{_safe(state['source'])} → {_safe(state['destination'])}"),
             ("전체 계획 / 검증 방식", f"{state['planned_files'] if state['planned_files'] is not None else '미확정'} files · {_bytes(state['planned_bytes'])} · {state['algorithm']}"),
             ("경과 / 단계 ETA", f"{_duration(now - self.started)} / {_duration(eta)}"),
-            ("단계 파일 / 내용량", f"{state['files']:,} / {state['total_files'] if state['total_files'] is not None else '미확정'} · {_bytes(state['bytes'])} / {_bytes(state['total_bytes'])}"),
+            ("검증 파일" if state.get("watching") else "단계 파일 / 내용량",
+             f"{state['files']:,} / {state['total_files'] if state['total_files'] is not None else '미확정'}" +
+             (" · 바이트 진행은 실행 화면에서 확인" if state.get("watching") else f" · {_bytes(state['bytes'])} / {_bytes(state['total_bytes'])}")),
             ("파일 처리 속도", f"{rate:.1f} files/s (단계 평균)" if rate else "측정 대기 · 전송은 배치 완료 후 반영"),
+            ("최근 파일 처리 속도", f"{recent:.1f} files/s (최대 10초 창)"),
             ("해시 읽기 속도", f"{_bytes(state['hash_bytes'] / max(now - state['hash_started'], 0.001))}/s" if state["hash_active"] else "-"),
             ("현재 읽는 파일", state["current"]),
             ("이번 단계 검증", f"성공 {state['successes']:,} · 실패 {state['failures']:,}"),
@@ -173,6 +210,8 @@ class Dashboard:
             value = state["rsync"]
             details.add_row(Text("rsync 참고 수치"), Text(
                 f"{_bytes(value['bytes'])} · {value['speed']} · 표시 시간 {value['time']}"))
+        if "database_bytes" in state:
+            details.add_row(Text("DB+WAL / 상태 디스크 여유"), Text(f"{_bytes(state['database_bytes'])} / {_bytes(state['state_free_bytes'])}"))
         yield Panel(Group(details, Text(""), progress, Text(_safe(state["note"], console.encoding), style="dim")),
                     title=Text("MigraFlow · LIVE", style="bold cyan"), border_style="cyan",
                     subtitle=Text("진행 표시는 완료 증거가 아닙니다 · 최종 결과를 확인하세요", style="dim"))

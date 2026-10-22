@@ -267,7 +267,7 @@ def test_version_one_database_upgrades_preserving_plan(config):
     with database(config.state_dir, readonly=True) as db:
         assert db.execute("SELECT id FROM plans").fetchone()[0] == planned["id"]
     with database(config.state_dir) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
         assert db.execute("SELECT COUNT(*) FROM file_results").fetchone()[0] == 0
         assert db.execute("SELECT id FROM plans").fetchone()[0] == planned["id"]
 

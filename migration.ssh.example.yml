@@ -1,0 +1,28 @@
+# Run the Python CLI inside Linux/WSL. Configure this alias in ~/.ssh/config.
+# Copy to migration.ssh.local.yml and replace paths; never put private keys/passwords here.
+source:
+  type: local
+  path: /srv/migraflow/source
+destination:
+  type: rsync_ssh
+  host: nas-target
+  path: /volume1/migration/data
+  # Remote local filesystem, outside BOTH endpoints and coordinator state, including bind aliases.
+  remote_state_dir: /var/tmp/migraflow-worker
+# The coordinator's local disk, outside both endpoints.
+state_dir: /var/lib/migraflow/state
+verification:
+  algorithm: sha256
+metadata:
+  policy: basic
+retry:
+  max_attempts: 3
+  initial_delay_seconds: 1
+  max_delay_seconds: 30
+timeouts:
+  transfer_idle_seconds: 1800
+  transfer_total_seconds: null
+  hash_idle_seconds: 1800
+  hash_total_seconds: null
+# For pull: put the rsync_ssh endpoint under source and the local endpoint under destination.
+# Source read-only protection is required in production, including on the remote server.

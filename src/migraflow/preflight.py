@@ -1,13 +1,18 @@
 import ctypes
+import hashlib
+import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from dataclasses import asdict
+from functools import lru_cache
 from pathlib import Path
+from .ssh import RemotePath, endpoint_root, preflight_ssh, remote_scope
 
-from .config import ConfigError
+from .config import ConfigError, TimeoutPolicy
 
 
 NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "9p", "drvfs", "fuse.sshfs"}
@@ -17,9 +22,10 @@ def _unescape(value):
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
 
 
-def mounts():
+@lru_cache(maxsize=1)
+def _parse_mounts(text):
     records = []
-    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+    for line in text.splitlines():
         left, right = line.split(" - ", 1)
         fields, extra = left.split(), right.split()
         record = {"point": _unescape(fields[4]), "root": _unescape(fields[3]),
@@ -28,7 +34,13 @@ def mounts():
         if record["fs"] in NETWORK_FS or record["fs"].startswith("fuse."):
             record["mount_id"] = fields[0]
         records.append(record)
-    return records
+    return tuple(sorted(records, key=lambda record: len(record["point"]), reverse=True))
+
+
+def mounts():
+    # Read the kernel table every time; cache parsing only while the bytes are identical.
+    return [dict(record, options=record["options"].copy())
+            for record in _parse_mounts(Path("/proc/self/mountinfo").read_text())]
 
 
 def _inside(path, root):
@@ -36,12 +48,21 @@ def _inside(path, root):
 
 
 def _no_links(path):
+    if isinstance(path, RemotePath):
+        path.call("check")
+        return
     for part in (path, *path.parents):
-        if part.is_symlink() or part.is_junction():
+        try:
+            info = part.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_reparse_tag", 0) == 0xA0000003:
             raise ConfigError(f"Symlink/junction path is not supported: {part}")
 
 
 def filesystem(path):
+    if isinstance(path, RemotePath):
+        return path.call("mount")
     if sys.platform == "win32":
         drive_type = ctypes.windll.kernel32.GetDriveTypeW(str(path.anchor))
         if drive_type != 3:  # DRIVE_FIXED: no UNC, mapped network or removable drive DBs
@@ -50,13 +71,34 @@ def filesystem(path):
                 "source": path.anchor, "root": path.anchor, "options": []}
     if sys.platform != "linux":
         raise ConfigError("This planning release supports Windows local paths and Linux only.")
-    candidates = [record for record in mounts() if _inside(path, Path(record["point"]))]
-    if not candidates:
-        raise ConfigError(f"Cannot identify filesystem: {path}")
-    return max(candidates, key=lambda record: len(record["point"]))
+    value = os.fspath(path)
+    for record in mounts():
+        point = record["point"]
+        if value == point or value.startswith(point.rstrip("/") + "/"):
+            return record
+    raise ConfigError(f"Cannot identify filesystem: {path}")
+
+
+def checked_filesystem(path):
+    # Every remote RPC already rejects links and checks fresh mount/root identity.
+    if not isinstance(path, RemotePath):
+        _no_links(path)
+    return filesystem(path)
+
+
+def checked_stat(path, expected_mount):
+    if isinstance(path, RemotePath):
+        if path.session.header["identity"]["mount"] != expected_mount:
+            raise ConfigError("Entry crosses an unexpected mount.")
+        return path.stat(follow_symlinks=False)
+    if checked_filesystem(path) != expected_mount:
+        raise ConfigError("Entry crosses an unexpected mount.")
+    return path.stat(follow_symlinks=False)
 
 
 def endpoint_identity(endpoint):
+    if endpoint.type == "rsync_ssh":
+        return endpoint_root(endpoint).call("identity")
     _no_links(endpoint.path)
     path = endpoint.path.resolve(strict=True)
     if not path.is_dir():
@@ -110,7 +152,14 @@ def _test_destination_write(path):
             raise ConfigError(f"Destination write test cleanup failed; temporary file remains at {name}: {exc}") from exc
 
 
+@remote_scope
 def preflight(config, *, test_destination_write=False):
+    if any(endpoint.type == "rsync_ssh" for endpoint in (config.source, config.destination)):
+        if sys.platform != "linux" or os.name == "nt":
+            raise ConfigError("SSH endpoints require the Python CLI inside Linux/WSL.")
+        return preflight_ssh(config, test_destination_write=test_destination_write)
+    if config.metadata_policy == "posix" and (sys.platform != "linux" or os.name == "nt"):
+        raise ConfigError("POSIX metadata preservation requires the Python CLI inside Linux/WSL.")
     source = endpoint_identity(config.source)
     destination = endpoint_identity(config.destination)
     src, dst = Path(source["path"]), Path(destination["path"])
@@ -166,12 +215,37 @@ def preflight(config, *, test_destination_write=False):
             "destination_write_permission": write_permission,
             "destination_write_test": "passed" if test_destination_write else "not_requested",
             "source_protection": "read-only mount" if source["read_only_mount"] else "unproven",
-            "hash_algorithm": config.hash_algorithm, "transfer_ready": False, "warnings": warnings}
+            "hash_algorithm": config.hash_algorithm, "metadata_policy": config.metadata_policy,
+            "transfer_ready": False, "warnings": warnings}
 
 
 def config_data(config):
     data = asdict(config)
-    data["source"]["path"] = str(config.source.path.resolve())
-    data["destination"]["path"] = str(config.destination.path.resolve())
+    # Keep fingerprints of existing default configurations stable.
+    if config.timeouts == TimeoutPolicy():
+        data.pop("timeouts")
+    for label in ("source", "destination"):
+        endpoint = getattr(config, label)
+        if endpoint.type == "rsync_ssh":
+            data[label]["path"] = str(endpoint.path)
+            data[label]["remote_state_dir"] = str(endpoint.remote_state_dir)
+        else:
+            data[label]["path"] = str(endpoint.path.resolve())
+            data[label].pop("host")
+            data[label].pop("remote_state_dir")
     data["state_dir"] = str(config.state_dir.resolve())
     return data
+
+
+def compatible_plan(saved, config):
+    """Authenticate saved config; only retry/time limits may change on reuse."""
+    original = json.dumps(saved["config"], sort_keys=True, ensure_ascii=True)
+    if hashlib.sha256(original.encode()).hexdigest() != saved["fingerprint"]:
+        return False
+    previous, current = saved["config"].copy(), config_data(config)
+    for data in (previous, current):
+        data.pop("retry", None)
+        data.pop("timeouts", None)
+        data.setdefault("hash_algorithm", "sha256")
+        data.setdefault("metadata_policy", "basic")
+    return previous == current

@@ -17,15 +17,16 @@ def main():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--forward-lease", action="store_true")
     parser.add_argument("--pin-roots", action="store_true")
-    parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--pin-index", type=int, choices=(-2, -1))
+    parser.add_argument("--timeout", type=float)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     try:
         with (file_lock(Path(args.lock)) if args.lock else nullcontext()), ExitStack() as roots:
             descriptors = []
-            if args.pin_roots:
-                for index in (-2, -1):
+            if args.pin_roots or args.pin_index is not None:
+                for index in ((-2, -1) if args.pin_roots else (args.pin_index,)):
                     fd = os.open(command[index], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                     roots.callback(os.close, fd)
                     descriptors.append(fd)

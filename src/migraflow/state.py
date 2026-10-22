@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .config import ConfigError
 from .locking import file_lock
+from .state_stats import deletion_summary, migrate
 
 
 def now():
@@ -37,9 +38,10 @@ def database(directory, *, readonly=False):
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA foreign_keys=ON")
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3):
+        if version not in (0, 1, 2, 3, 4, 5, 6):
             raise ConfigError("Unsupported state database schema version.")
         if not readonly:
+            connection.execute("PRAGMA recursive_triggers=ON")
             if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                 raise ConfigError("Cannot enable SQLite WAL.")
             connection.execute("PRAGMA synchronous=FULL")
@@ -74,12 +76,38 @@ def database(directory, *, readonly=False):
                     batch INTEGER NOT NULL, attempt INTEGER NOT NULL, created_at TEXT NOT NULL,
                     outcome TEXT NOT NULL, error TEXT, delay_seconds REAL NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS plan_lineage (
+                    plan_id TEXT PRIMARY KEY REFERENCES plans(id),
+                    baseline_id TEXT NOT NULL REFERENCES plans(id),
+                    scan_complete INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS entry_metadata (
+                    plan_id TEXT NOT NULL REFERENCES plans(id), path BLOB NOT NULL,
+                    source_json TEXT NOT NULL, PRIMARY KEY(plan_id,path)
+                );
+                CREATE TABLE IF NOT EXISTS reports (
+                    id TEXT PRIMARY KEY, plan_id TEXT NOT NULL REFERENCES plans(id),
+                    created_at TEXT NOT NULL, result TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS report_extras (
+                    report_id TEXT NOT NULL REFERENCES reports(id), path BLOB NOT NULL,
+                    kind TEXT NOT NULL, PRIMARY KEY(report_id,path)
+                );
+                CREATE INDEX IF NOT EXISTS result_status ON file_results(plan_id,status);
+                CREATE INDEX IF NOT EXISTS result_errors ON file_results(plan_id,path) WHERE error IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS entry_directories ON entries(plan_id,length(path) DESC) WHERE kind='directory';
+                CREATE INDEX IF NOT EXISTS attempt_outcomes ON attempts(plan_id,outcome);
             """)
             columns = {item[1] for item in connection.execute("PRAGMA table_info(file_results)")}
             if "copied" not in columns:
                 connection.execute("ALTER TABLE file_results ADD COLUMN copied INTEGER NOT NULL DEFAULT 0")
                 connection.execute("UPDATE file_results SET copied=1 WHERE status IN ('TRANSFERRED','VERIFIED','VERIFY_FAILED','UNVERIFIED') AND source_generation<>'null'")
-            connection.execute("PRAGMA user_version=3")
+            columns = {item[1] for item in connection.execute("PRAGMA table_info(directories)")}
+            if "generation" not in columns:
+                connection.execute("ALTER TABLE directories ADD COLUMN generation TEXT NOT NULL DEFAULT 'null'")
+            connection.commit()
+            if version < 6:
+                migrate(connection)
             connection.commit()
         yield connection
     finally:
@@ -94,29 +122,49 @@ def summary(connection, plan_id=None):
     result = dict(row)
     result["config"] = json.loads(result["config"])
     result["hash_algorithm"] = result["config"].get("hash_algorithm", "sha256")
+    result["metadata_policy"] = result["config"].get("metadata_policy", "basic")
     result["preflight"] = json.loads(result["preflight"])
     result["reused_files"] = result["preflight"].get("execution_options", {}).get("reused_files", 0)
     if result["status"] not in ("PLANNED", "SCANNING", "BLOCKED"):
         result["warnings"] = [warning for warning in result["preflight"].get("warnings", [])
                               if not warning.startswith("Metadata planning only")]
-    result["counts"] = dict(connection.execute(
-        "SELECT action, COUNT(*) FROM entries WHERE plan_id=? GROUP BY action", (row["id"],)).fetchall())
-    result["files"] = connection.execute(
-        "SELECT COUNT(*) FROM entries WHERE plan_id=? AND kind='file'", (row["id"],)).fetchone()[0]
-    result["bytes"] = connection.execute(
-        "SELECT COALESCE(SUM(size),0) FROM entries WHERE plan_id=? AND kind='file'", (row["id"],)).fetchone()[0]
+    result["counts"] = {}
+    result["files"], result["bytes"] = 0, 0
+    fast = connection.execute("PRAGMA user_version").fetchone()[0] >= 6
+    inventory_query = """SELECT action,COUNT(*),
+            SUM(CASE WHEN kind='file' THEN 1 ELSE 0 END),
+            COALESCE(SUM(CASE WHEN kind='file' THEN size ELSE 0 END),0)
+            FROM entries WHERE plan_id=? GROUP BY action"""
+    if fast:
+        inventory_query = "SELECT action,count,files,bytes FROM inventory_counts WHERE plan_id=? AND count>0"
+    for action, count, files, size in connection.execute(inventory_query, (row["id"],)):
+        result["counts"][action] = count
+        result["files"] += files
+        result["bytes"] += size
     result["issues"] = [{"path": os.fsdecode(item[0]), "detail": item[1]} for item in connection.execute(
         "SELECT path, detail FROM entries WHERE plan_id=? AND action='BLOCKED' LIMIT 20", (row["id"],))]
     result["transfer_ready"] = False
     result["cutover_ready"] = False
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='plan_lineage'").fetchone():
+        lineage = connection.execute("SELECT * FROM plan_lineage WHERE plan_id=?", (row["id"],)).fetchone()
+        if lineage is not None:
+            result["baseline_id"] = lineage["baseline_id"]
+            result["deletion_candidates_complete"] = bool(lineage["scan_complete"])
+            if lineage["scan_complete"]:
+                cached = connection.execute("SELECT count,sample FROM deletion_stats WHERE plan_id=? AND baseline_id=?",
+                    (row["id"], lineage["baseline_id"])).fetchone() if fast else None
+                count, sample = (cached[0], json.loads(cached[1])) if cached else deletion_summary(
+                    connection, row["id"], lineage["baseline_id"])
+                result["deletion_candidates_count"] = count
+                result["deletion_candidates"] = sample
     if connection.execute("SELECT 1 FROM sqlite_master WHERE name='attempts'").fetchone():
         result["retry_count"] = connection.execute(
             "SELECT COUNT(*) FROM attempts WHERE plan_id=? AND outcome IN ('RETRY','HASH_RETRY')", (row["id"],)).fetchone()[0]
     if connection.execute("SELECT 1 FROM sqlite_master WHERE name='file_results'").fetchone():
         result["file_statuses"] = dict(connection.execute(
-            "SELECT status, COUNT(*) FROM file_results WHERE plan_id=? GROUP BY status", (row["id"],)).fetchall())
-        result["verified_files"] = connection.execute(
-            "SELECT COUNT(*) FROM file_results WHERE plan_id=? AND status='VERIFIED'", (row["id"],)).fetchone()[0]
+            ("SELECT status,count FROM verification_counts WHERE plan_id=? AND count>0" if fast else
+             "SELECT status, COUNT(*) FROM file_results WHERE plan_id=? GROUP BY status"), (row["id"],)).fetchall())
+        result["verified_files"] = result["file_statuses"].get("VERIFIED", 0)
         result["issues"].extend({"path": os.fsdecode(item[0]), "detail": item[1]} for item in connection.execute(
             "SELECT path, error FROM file_results WHERE plan_id=? AND error IS NOT NULL LIMIT 20", (row["id"],)))
     return result

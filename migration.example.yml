@@ -16,11 +16,23 @@ state_dir: state
 verification:
   algorithm: sha256
 
+# basic preserves content/size/mtime. posix adds mode/UID/GID/ACL/xattrs (Linux CLI only).
+metadata:
+  policy: basic
+
 # max_attempts includes the first attempt. Only transient transfer/read errors retry.
 retry:
   max_attempts: 3
   initial_delay_seconds: 1
   max_delay_seconds: 30
+
+# IO/read progress timeout; null total limits allow long-running batches/files.
+# hash limits apply only to remote SSH hashes, not local hash calls.
+timeouts:
+  transfer_idle_seconds: 1800
+  transfer_total_seconds: null
+  hash_idle_seconds: 1800
+  hash_total_seconds: null
 
 # Linux NAS example: replace the endpoints above; run Python inside Linux/WSL.
 # mount_source must match the Linux mount table (NFS nas:/export or CIFS //nas/share).

@@ -1,135 +1,231 @@
 # MigraFlow
 
-로컬 파일시스템과 원격 NAS 사이의 대규모 파일 이전을 위한 Python CLI/CUI 프로젝트입니다. 실행 인스턴스에서 rsync 전송을 제어하고 SQLite 상태관리, 재개, SHA-256 검증을 제공하는 것을 목표로 합니다.
+**계획하고, 전송하고, 검증하는 파일 마이그레이션 CLI.**
 
-## 현재 구현 상태
+MigraFlow는 로컬 디렉터리와 NAS 사이의 파일 이전을 위한 Python 도구입니다. rsync로 데이터를 전송하고 SQLite에 작업 상태를 기록해 중단 후 재개, 증분 동기화, 파일별 내용 검증을 제공합니다. Linux 중계 인스턴스에서 NAS 간 이전을 제어하거나 SSH로 원격 파일을 보내고 받을 수 있습니다.
 
-2026-10-14 기준 로컬→로컬과 Linux NAS 마운트 경로의 rsync 전송·재개·전체 파일 내용 해시 검증을 제공합니다. YAML/CLI 설정, 사전 점검, 점진 스캔, SQLite WAL 저장, Rich/JSON 출력, run·resume·verify·status를 사용할 수 있습니다.
+```text
+사전 점검 → 계획 생성 → 전송 → 전체 해시 검증 → 전환 준비 점검
+```
 
-plan은 계획만 생성하며 run이 실제 전송 후 자동 검증합니다. verify는 저장된 전송을 다시 검증합니다. Windows Python + WSL rsync 및 Ubuntu 직접 실행으로 실제 로컬 전송을 검증했습니다. 같은 계획 ID의 전송 재개·검증 완료 체크포인트 재사용·일시 오류 제한 재시도와 실행 중 Rich 실시간 화면을 지원합니다. NAS 조합은 모의 Linux 마운트 정체성과 실제 rsync로 검사하며 실제 NAS 호환성·단절은 별도 검증이 필요합니다. 스캔 재개·새 회차 간 증분 최적화·cutover와 대규모 성능 검증은 아직 미구현/미검증입니다.
+현재 개발 단계입니다. 로컬 전송과 loopback SSH 통합 시험을 수행했으며, NAS 마운트 조합은 모의 마운트 정체성과 실제 rsync로 검사했습니다. **실제 NAS 호환성과 100만~1000만 파일 규모는 아직 검증하지 않았습니다.**
+
+## 목차
+
+- [주요 기능](#주요-기능)
+- [지원 환경](#지원-환경)
+- [설치](#설치)
+- [빠른 시작](#빠른-시작)
+- [설정](#설정)
+- [사용 가이드](#사용-가이드)
+- [데이터 안전과 제한](#데이터-안전과-제한)
+- [개발 및 기여](#개발-및-기여)
+- [문서](#문서)
+- [라이선스](#라이선스)
+
+## 주요 기능
+
+- **여러 전송 경로:** 로컬↔로컬, 로컬↔NAS 마운트, NAS 마운트↔NAS 마운트, SSH push/pull.
+- **계획 기반 실행:** 파일 목록과 충돌·덮어쓰기 후보를 확인한 뒤 별도 명령으로 전송.
+- **중단 복구:** SQLite WAL 체크포인트, 스캔·전송 재개, 일시 오류의 제한 자동 재시도.
+- **내용 검증:** SHA-256 기본값, 선택적 MD5, 현재 양쪽 해시가 일치하는 파일의 재복사 생략.
+- **증분 동기화:** 검증 완료 회차를 기준으로 새 원본 목록을 스캔하고 신규·변경 파일 반영.
+- **진행 상황 확인:** Rich 실시간 화면, 별도 상태 감시, JSON 출력.
+- **메타데이터와 전환 점검:** 선택적 Linux POSIX 속성 보존·검증, 대상 추가 항목 조사, 전환 준비 보고서.
+
+## 지원 환경
+
+| 실행 환경 | 지원하는 전송 경로 | 필요 사항 |
+|---|---|---|
+| Linux / WSL 내부 Python | `local` / `mounted`의 모든 조합, 한쪽 `rsync_ssh` | Python 3.12+, rsync |
+| Windows Python | 고정 로컬 드라이브의 `local → local` | Python 3.12+, 기본 WSL 배포판의 Python 3·rsync |
+| SSH 원격 서버 | Linux 서버로 push / 서버에서 pull | Python 3.8+, rsync 3.1.3+, 키/agent 인증 |
+
+`local`은 실행 인스턴스의 경로, `mounted`는 그 Linux 환경에 미리 마운트한 NAS 공유입니다. NAS와 SSH를 사용하려면 **Python CLI도 Linux/WSL 안에서 실행**합니다. Windows 네트워크 드라이브·UNC와 양쪽 모두 `rsync_ssh`인 직접 전송은 지원하지 않습니다.
+
+SSH에는 실행 인스턴스의 OpenSSH client와 원격 `/etc/machine-id`가 필요합니다. 자세한 조건은 [SSH 가이드](docs/SSH.md)를 참고하세요.
 
 ## 설치
 
-Python 3.12 이상이 필요합니다. 프로젝트 폴더의 PowerShell에서 실행합니다.
+저장소를 내려받습니다.
 
-~~~powershell
+```sh
+git clone https://github.com/keysburn/migraflow.git
+cd migraflow
+```
+
+### Linux / WSL
+
+Python 3.12 이상과 rsync를 먼저 준비한 뒤 Linux 가상환경에 설치합니다.
+
+```sh
+python3 --version
+rsync --version
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install .
+migraflow --help
+```
+
+WSL에서는 Windows용 가상환경을 재사용하지 않습니다. 상태 DB는 `/mnt/c`나 NAS 공유 대신 WSL의 Linux 로컬 파일시스템에 둡니다.
+
+### Windows PowerShell
+
+로컬→로컬 전송을 사용할 때의 설치 방법입니다.
+
+```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
-~~~
-
-이미 가상환경이 있다면 활성화와 설치만 진행합니다.
-
-실제 전송에는 rsync가 필요합니다. Windows CLI는 기본 WSL 배포판의 rsync와 표준 Python 3 감시 프로세스를 호출합니다. 아래 명령으로 사용할 수 있는지 확인합니다.
-
-~~~powershell
-wsl --exec rsync --version
+python -m pip install .
 wsl --exec python3 --version
-~~~
+wsl --exec rsync --version
+migraflow --help
+```
 
-기본 WSL 배포판이 Ubuntu라면 rsync가 없을 때 Ubuntu 터미널에서 설치합니다.
+Windows의 실제 전송은 기본 WSL 배포판의 rsync를 호출합니다. WSL에 Python 3와 rsync가 없으면 먼저 설치해야 합니다.
 
-~~~sh
-sudo apt update
-sudo apt install rsync python3
-~~~
+## 빠른 시작
 
-Linux에서 Python CLI를 실행할 때는 같은 환경의 rsync를 사용합니다. Linux CLI에서는 Linux 경로와 로컬 상태 디스크를 사용합니다. Windows CLI는 고정 로컬 드라이브 경로만 지원하며 WSL 경로 변환이 실패하면 전송을 중지합니다.
+아래는 **격리된 로컬 샘플 데이터**로 시험하는 절차입니다. Linux/WSL에서는 Linux 로컬 파일시스템의 작업 폴더를 사용합니다. 그 안에 `demo/source`와 빈 `demo/destination` 디렉터리를 만들고 source에 시험 파일을 준비합니다.
 
-## 설정 파일로 사용
+`migration.local.yml`을 다음과 같이 작성합니다.
 
-출발지·목적지·상태 저장 위치는 YAML에 미리 작성합니다.
-
-~~~powershell
-Copy-Item migration.example.yml migration.local.yml
-~~~
-
-migration.local.yml을 수정합니다. 출발지와 목적지는 미리 존재하는 디렉터리여야 합니다. Windows 경로는 작은따옴표를 사용하면 역슬래시를 그대로 적을 수 있습니다.
-
-이 개발 세션에서는 migration.local.yml을 work/demo의 로컬 샘플 경로로 생성했습니다. 현재 파일을 유지하면 바로 계획 기능을 시험할 수 있습니다. 실제 경로를 사용하기 전에 이 파일을 수정하세요. 샘플과 로컬 설정은 Git에서 제외합니다.
-
-~~~yaml
+```yaml
 source:
   type: local
-  path: 'C:\data\source'
+  path: demo/source
 destination:
   type: local
-  path: 'C:\data\destination'
+  path: demo/destination
 state_dir: state
-~~~
+```
 
-~~~powershell
+사전 점검과 계획 생성은 양쪽 데이터를 수정하지 않습니다.
+
+```sh
 migraflow preflight
 migraflow plan
-migraflow status
-~~~
+```
 
-기본 파일은 현재 폴더의 migration.local.yml입니다. 다른 파일은 명시적으로 지정합니다.
+계획 결과가 `PLANNED`인지 확인하고 출력된 `id`를 다음 명령의 `PLAN_ID`에 넣습니다. 읽기 전용 보호가 없는 시험 디렉터리에는 개발용 예외를 명시합니다.
 
-~~~powershell
-migraflow plan --config my-migration.yml --json
-migraflow status --config my-migration.yml --job PLAN_ID
-~~~
-
-YAML 안의 상대 경로는 설정 파일 위치 기준입니다. 알 수 없는 키, 중복 키, 잘못된 타입을 거부합니다. .env 로딩과 환경변수 치환은 현재 지원하지 않으며 YAML에 비밀번호를 넣지 않습니다.
-
-## 목적지 쓰기 권한과 실제 쓰기 시험
-
-기본 preflight는 목적지의 쓰기·탐색 권한과 읽기 전용 마운트 여부만 조회하고 파일을 만들지 않습니다. destination_write_permission은 권한 조회 결과이며 실제 쓰기를 보장하지 않습니다. 특히 Windows ACL과 NAS 권한은 실제 쓰기 결과와 다를 수 있습니다. 권한 조회가 실패하면 경고하며 읽기 전용 plan은 계속 사용할 수 있습니다.
-
-~~~powershell
-migraflow preflight --config migration.local.yml --json
-migraflow preflight --config migration.local.yml --test-destination-write --json
-~~~
-
---test-destination-write는 preflight에서만 지원합니다. 안전 점검과 소스·목적지 정체성 재확인 후 목적지 루트에 .migraflow-write-test-로 시작하는 고유 임시 파일을 배타적으로 생성하고, 작은 시험 데이터를 기록·flush·fsync한 뒤 닫고 삭제합니다. 성공하면 destination_write_test는 passed, 기본 실행은 not_requested입니다. 소스와 기존 대상 파일은 수정하지 않지만 목적지 디렉터리 mtime는 바뀔 수 있습니다. YAML에 옵션을 저장하거나 plan/run/resume/verify에서 자동 실행하지 않습니다.
-
-생성·기록·동기화·삭제 실패는 종료 코드 2로 보고합니다. 실패나 일반 사용자 중단에도 임시 파일 삭제를 시도하며 삭제 실패 시 남은 파일 경로를 오류에 표시합니다. 강제 종료·전원 장애 시 파일이 남을 수 있습니다. 시험 성공은 기존 파일 덮어쓰기·하위 디렉터리 권한·미래 전송 성공을 보장하지 않으며 transfer_ready와 cutover_ready도 승격하지 않습니다.
-
-## 실제 전송
-
-먼저 plan 결과의 id와 덮어쓰기 후보를 검토합니다.
-
-~~~powershell
-migraflow plan
-migraflow run --job PLAN_ID
-migraflow verify --job PLAN_ID
-migraflow status --job PLAN_ID
-~~~
-
-run은 설정과 endpoint 정체성이 저장된 계획과 일치하는지 확인하고, 계획에 있는 정규 파일과 빈 디렉터리를 rsync로 전송합니다. 모든 정규 파일을 설정된 SHA-256/MD5로 양쪽에서 다시 읽어 비교하고 파일 크기·mtime, 디렉터리 존재·mtime도 확인합니다. 검증 성공은 VERIFIED, 내용 또는 메타데이터 불일치는 VERIFY_FAILED입니다. 전송 실패를 성공으로 표시하지 않습니다.
-
-운영에서는 읽기 전용 소스 마운트를 요구합니다. 읽기 전용 보호가 확인되지 않는 Windows/개발용 로컬 샘플은 격리된 테스트 데이터에서 다음 옵션으로만 실행합니다. 이 옵션은 소스의 외부 쓰기를 막지 않으며 사용 여부를 작업 기록에 저장합니다.
-
-~~~powershell
+```sh
 migraflow run --job PLAN_ID --allow-unprotected-source
-~~~
+migraflow status --job PLAN_ID
+migraflow verify --job PLAN_ID
+```
 
-대상에 이미 있는 파일은 기본적으로 덮어쓰지 않습니다. 계획을 검토하고 복구 가능한 백업을 확보한 작업에만 다음 옵션을 사용합니다.
+`run`은 복사 후 전체 내용 검증까지 수행하며 성공 상태는 `VERIFIED`입니다. **운영에서는 소스를 읽기 전용 마운트로 보호하고 `--allow-unprotected-source`를 사용하지 않습니다.** 쓰기 동결 또는 스냅샷으로 운영 서비스의 원본 변경도 별도로 제어해야 합니다.
 
-~~~powershell
-migraflow run --job PLAN_ID --overwrite --allow-unprotected-source
-~~~
+## 설정
 
-원본과 대상에만 있는 파일은 삭제하지 않습니다. rsync는 임시 파일을 작성한 뒤 최종 파일을 교체하며 --inplace·--delete·--remove-source-files는 사용하지 않습니다. 새 계획의 최초 전송은 같은 크기·mtime만으로 건너뛰지 않습니다. 재개에서는 저장된 해시와 현재 양쪽 내용을 대조해 일치하는 파일을 복사 목록에서 제외합니다. 새로운 계획/회차 사이의 증분 최적화는 이후 단계입니다.
+기본 파일은 현재 폴더의 `migration.local.yml`입니다. [전체 예제](migration.example.yml)를 복사해 수정하거나 `--config`로 다른 파일을 지정할 수 있습니다.
 
-소스·endpoint·알고리즘이 바뀐 경우 새 plan을 생성해야 합니다. 중단/실패한 같은 계획은 resume으로 계속할 수 있습니다. 작업 기록은 state_dir/migraflow.sqlite3, rsync 로그와 NUL 매니페스트는 state_dir/transfer-PLAN_ID에 저장합니다. 과거 기록은 자동 삭제하지 않습니다.
+```sh
+migraflow plan --config migration.local.yml
+migraflow plan --config migration.local.yml --destination /srv/new-destination
+```
 
-## NAS 마운트 경로 전송
+설정 파일 없이 경로를 직접 지정할 수도 있습니다.
 
-Linux에서 local→mounted, mounted→local, mounted→mounted를 지원합니다. Windows에서는 **Python CLI 자체를 WSL/Linux 안에서 실행**하고 NAS를 그 Linux 환경에 마운트해야 합니다. Windows Python에 UNC나 네트워크 드라이브를 전달하는 방식은 지원하지 않습니다. Python 3.12 이상, rsync와 프로젝트 의존성이 Linux 환경에도 필요합니다.
+```powershell
+migraflow plan --source 'C:\data\source' --destination 'D:\data\destination' --state-dir state
+```
 
-WSL에서는 Windows의 .venv를 재사용하지 않고 별도 Linux 가상환경을 만듭니다. 다음 명령은 Python 3.12 이상과 venv 지원이 설치된 WSL 터미널에서 실행합니다.
+우선순위는 **CLI 옵션 → YAML → 기본값**입니다. YAML의 상대 경로는 설정 파일 위치, CLI의 상대 경로는 현재 작업 폴더 기준입니다. `.env` 로딩과 환경변수 치환은 지원하지 않으며 알 수 없는 키와 중복 YAML 키를 거부합니다.
 
-~~~sh
-python3 -m venv ~/.venvs/migraflow
-. ~/.venvs/migraflow/bin/activate
-python -m pip install -e /mnt/c/Users/Coreit/Documents/Projects/migraflow
-~~~
+### 경로와 검증 정책
 
-관리자가 마운트를 먼저 준비합니다. MigraFlow는 마운트 생성·재연결이나 NAS 인증을 수행하지 않습니다. 소스는 읽기 전용 마운트, 대상은 쓰기 가능한 마운트와 전용 이전 디렉터리를 사용합니다. NFS는 nas:/export, SMB/CIFS는 //nas/share와 같이 **Linux 마운트 테이블에 표시되는 source 문자열**을 mount_source에 정확히 적습니다. 자격증명은 설정·로그·Git에 넣지 않습니다.
+| 항목 | 설명 |
+|---|---|
+| `source`, `destination` | 각각 `type`과 `path` 지정. 양쪽 데이터 디렉터리는 미리 존재해야 함 |
+| `type: local` | 실행 인스턴스의 로컬 경로. 기본 타입 |
+| `type: mounted` | Linux NAS 마운트 경로. 예상 공유 정체성인 `mount_source` 필수 |
+| `type: rsync_ssh` | OpenSSH 별칭 `host`, 절대 POSIX `path`, 원격 로컬 디스크의 `remote_state_dir` 필수 |
+| `state_dir` | 데이터 경로 밖의 로컬 상태 디렉터리. 기본값 `state` |
+| `verification.algorithm` | `sha256` 기본값 또는 `md5` |
+| `metadata.policy` | `basic` 기본값 또는 Linux 전용 `posix` |
 
-~~~yaml
+`basic`은 내용·크기·mtime와 디렉터리 존재·mtime를 검증합니다. `posix`는 계획 항목의 mode, numeric UID/GID, POSIX ACL/xattr도 보존·검증합니다. endpoint 루트와 NAS 고유 ACL·계정 매핑은 별도 검토 대상입니다. MD5는 SHA-256보다 충돌 저항성이 약합니다. 해시 알고리즘이나 메타데이터 정책을 바꾸면 새 계획이 필요합니다.
+
+### 자동 재시도
+
+```yaml
+verification:
+  algorithm: sha256
+metadata:
+  policy: basic
+retry:
+  max_attempts: 3
+  initial_delay_seconds: 1
+  max_delay_seconds: 30
+```
+
+`max_attempts`는 최초 시도를 포함해 1~10회입니다. 지수 백오프를 사용하며 대기값은 0~30초, 초기값은 최대값 이하여야 합니다. 일시 IO·연결 오류만 재시도하고 권한·공간 부족·정책 위반·내용 불일치는 자동 재시도로 우회하지 않습니다.
+
+### 장시간 작업의 시간 제한
+
+```yaml
+timeouts:
+  transfer_idle_seconds: 1800
+  transfer_total_seconds: null
+  hash_idle_seconds: 1800
+  hash_total_seconds: null
+```
+
+기본값은 **총 실행시간 제한 없음**, 무진행 제한 1800초입니다. `transfer_idle_seconds`는 rsync의 IO 무진행 제한, `transfer_total_seconds`는 선택적인 배치 실행 상한입니다. worker 준비·종료 시간은 별도이며 모든 로컬 파일시스템 호출의 정체를 감시하지는 않습니다.
+
+`hash_idle_seconds`와 `hash_total_seconds`는 **SSH 원격 파일 해시**에 적용합니다. 실제 읽기 바이트 증가만 무진행 시간을 갱신합니다. 일반 SSH 메타데이터 RPC는 60초 제한이며 로컬 해시 호출에는 이 두 설정을 적용하지 않습니다.
+
+단위는 초입니다. 값은 0보다 크고 2,147,483,647 이하의 유한 숫자이며 `transfer_idle_seconds`는 정수입니다. 총 제한만 `null`을 허용합니다. `retry`와 `timeouts`는 재개·새 증분 회차에서 변경할 수 있습니다.
+
+## 사용 가이드
+
+### 명령어
+
+| 명령 | 용도 |
+|---|---|
+| `preflight` | 경로·권한·마운트·소스 보호 상태 점검 |
+| `plan` | 파일 목록과 충돌·덮어쓰기 후보를 기록하고 계획 ID 발급 |
+| `run --job PLAN_ID` | 계획에 따라 전송한 뒤 전체 검증 |
+| `resume --job PLAN_ID` | 같은 계획의 중단·실패한 전송/검증 재개 |
+| `verify --job PLAN_ID` | 현재 양쪽 파일을 다시 읽어 검증 |
+| `status --job PLAN_ID` | 저장된 상태 조회. ID 생략 시 최신 작업 |
+| `cutover-check --job PLAN_ID` | 새 검증·대상 조사 후 전환 준비 보고서 생성 |
+
+명령별 전체 옵션은 `migraflow COMMAND --help`로 확인합니다. `python -m migraflow`도 같은 CLI를 실행합니다.
+
+### 중단 후 재개
+
+```sh
+migraflow resume --job PLAN_ID
+migraflow plan --resume INTERRUPTED_SCAN_ID
+```
+
+`resume --job`은 전송·검증, `plan --resume`은 스캔 재개입니다. 로컬 개발 시험은 `resume`에도 `--allow-unprotected-source`를 추가합니다. 검증 완료 파일도 현재 양쪽 해시를 다시 읽지만 일치하면 재복사하지 않습니다. 원본 세대·경로 정체성·해시/메타데이터 정책이 달라졌으면 새 계획이 필요합니다.
+
+상태 DB와 대상의 `.migraflow-partial-PLAN_ID` 부분 파일을 유지하세요. 활성 worker가 남아 있으면 재개를 차단하므로 잠금 파일을 삭제해 우회하지 않습니다.
+
+재개 전 검사에서 원본 파일의 크기·수정 시각·누락 또는 디렉터리 변경을 발견하면 작업을 `VERIFY_FAILED`로 기록하고 이전 검증 상태와 해시를 무효화합니다. 원본 변경을 확인한 뒤 새 계획을 생성하세요.
+
+상태 DB는 schema v6입니다. 기존 v1~v5 DB는 첫 쓰기 명령에서 집계를 생성하며 업그레이드합니다. 큰 DB는 최초 업그레이드에 시간이 걸릴 수 있습니다. `status`는 읽기 전용이며 구형 DB도 기존 집계 방식으로 조회합니다. 업그레이드 후에는 v6 지원 버전을 사용하세요.
+
+### 새 회차 증분 동기화
+
+```sh
+migraflow plan --baseline PREVIOUS_VERIFIED_ID
+migraflow run --job NEW_PLAN_ID
+```
+
+동일한 경로·정체성·해시/메타데이터 정책과 `state_dir`의 `VERIFIED` 작업을 기준으로 새 목록을 스캔합니다. 현재 양쪽 내용이 같은 기준 파일은 재사용하고 신규·변경 파일을 전송합니다. 복사 생략에도 해시 읽기 IO가 발생합니다.
+
+기존 대상 파일을 교체해야 한다면 계획과 복구 수단을 확인한 뒤 **해당 회차에** `--overwrite`를 지정합니다. 이전 회차의 승인은 승계하지 않습니다. 소스에서 사라진 항목은 삭제 후보로만 보고하며 대상에서 삭제하지 않습니다.
+
+### NAS 마운트 경로 전송
+
+관리자가 Linux에서 공유를 먼저 마운트한 후 설정합니다. `mount_source`는 Linux 마운트 테이블에 표시되는 공유 문자열과 일치해야 합니다.
+
+```yaml
 source:
   type: mounted
   path: /mnt/nas-source/data
@@ -139,166 +235,95 @@ destination:
   path: /mnt/nas-destination/migration
   mount_source: nas-destination:/export/data
 state_dir: /var/lib/migraflow/state
-verification:
-  algorithm: sha256
-retry:
-  max_attempts: 3
-  initial_delay_seconds: 1
-  max_delay_seconds: 30
-~~~
+```
 
-로컬↔NAS는 해당 endpoint를 type: local과 Linux 경로로 바꾸고 그 endpoint의 mount_source를 제거합니다. 로컬 소스도 읽기 전용 bind mount로 보호합니다. state_dir는 양쪽 경로 밖의 중계 로컬 디스크에 둡니다. WSL에서는 /mnt/c 대신 Linux 로컬 파일시스템에 상태 DB를 둡니다.
+NFS 예제이며 SMB/CIFS는 `//nas/share` 형태의 실제 공유 정체성을 사용합니다. 한쪽을 `local`로 바꾸면 로컬↔NAS 조합이 됩니다. 소스는 읽기 전용, 대상은 쓰기 가능해야 합니다. 마운트가 사라지거나 정체성이 바뀌면 중지하며 재마운트한 경우 새 계획을 만듭니다. [NAS 시험 절차](docs/NAS_TESTING.md)를 먼저 확인하세요.
 
-~~~sh
-python -m migraflow preflight --config migration.local.yml --json
-python -m migraflow plan --config migration.local.yml --json
-python -m migraflow run --config migration.local.yml --job PLAN_ID
-python -m migraflow resume --config migration.local.yml --job PLAN_ID
-python -m migraflow verify --config migration.local.yml --job PLAN_ID
-~~~
+### 마운트 없는 SSH 전송
 
-마운트 source·mount ID·경로·루트 정체성을 계획과 대조하고 전송 중 약 0.2초마다 마운트 테이블을 확인합니다. 해제·다른 공유·읽기 전용 전환을 탐지하면 전송을 중지합니다. rsync는 열린 루트 디렉터리 FD를 사용해, 마운트 해제 시 노출된 빈 로컬 디렉터리로 경로가 바뀌는 것을 막습니다. 감시 장치가 rsync 종료를 확인하기 전에는 재개를 허용하지 않습니다.
+로컬 설정의 `destination`을 다음과 같이 지정하면 push, `source`에 지정하면 pull입니다. 반대쪽은 `local` 또는 `mounted`여야 합니다.
 
-네트워크 단절 뒤 **마운트 자체가 유지되고** 원본 세대가 같으면 원인 해결 후 같은 계획을 resume할 수 있습니다. 마운트를 해제하고 다시 연결하면 같은 공유여도 mount ID가 달라지므로 새 plan이 필요합니다. 이전 버전에서 만든 mounted 계획도 mount ID가 없으므로 새 계획을 만드세요. 네트워크 파일시스템의 차단된 IO는 OS 마운트 정책에 따라 오래 걸릴 수 있습니다. 폴링은 순간적인 연결 문제나 모든 동시 경로 교체를 보장하지 않습니다.
+```yaml
+destination:
+  type: rsync_ssh
+  host: nas-target
+  path: /volume1/migration/data
+  remote_state_dir: /var/tmp/migraflow-worker
+```
 
-내용 해시는 기존 SHA-256/MD5 정책을 그대로 적용합니다. NAS의 시간 정밀도 때문에 계획의 mtime를 정확히 보존할 수 없으면 검증 실패로 보고하며 허용 오차를 자동으로 넓히지 않습니다. 실제 NFS/SMB NAS의 권한·mtime·inode 안정성·단절/복구를 전용 샘플에서 검증한 뒤 운영 데이터를 이전하세요.
+`host`는 `~/.ssh/config`의 별칭으로 지정하고 계정·포트·키는 SSH 설정에서 관리합니다. 검증된 호스트 키와 키/agent 인증이 필요하며 비밀번호 프롬프트·호스트 키 자동 승인은 사용하지 않습니다. `remote_state_dir`는 양쪽 데이터와 조정자 상태 경로에 겹치지 않는 원격 로컬 디스크 위치여야 합니다. [SSH 설정 예제](migration.ssh.example.yml)와 [상세 가이드](docs/SSH.md)를 참고하세요.
 
-## 중단 후 재개와 자동 재시도
+### Rich 실시간 화면
 
-Ctrl+C 또는 프로그램 강제 종료 후 **새 plan을 만들지 않고 같은 PLAN_ID**로 실행합니다.
+```sh
+migraflow run --job PLAN_ID --live
+migraflow status --job PLAN_ID --watch --interval 2
+migraflow status --job PLAN_ID --json
+```
 
-~~~powershell
-migraflow resume --job PLAN_ID
-migraflow status --job PLAN_ID
-~~~
+대화형 터미널에서는 실행 화면이 자동으로 켜지며 `--no-live`로 끕니다. 현재 단계, 파일 수, 해시 읽기 진행, 검증 체크포인트, 재시도·재사용 수를 표시합니다. rsync의 속도·백분율은 배치 참고 수치이며 최종 성공 여부는 저장된 검증 결과로 판단합니다.
 
-읽기 전용 보호가 없는 격리된 개발용 경로는 재개에도 명시적으로 옵션을 전달합니다.
+실행 중 Ctrl+C는 작업을 중단합니다. 별도 `status --watch`에서는 관찰만 종료합니다. 감시 간격은 1~60초이며 다른 프로세스의 현재 파일·순간 전송 바이트는 표시하지 않습니다. JSON/리다이렉션에서는 실행 화면을 자동으로 끄고 `--live --json`과 `--watch --json`은 함께 사용할 수 없습니다.
 
-~~~powershell
-migraflow resume --job PLAN_ID --allow-unprotected-source
-~~~
+### 전환 준비 점검
 
-배치마다 복사 후 해시 검증을 커밋합니다. 재개 시 SQLite 무결성·설정·소스/대상 정체성·원본 세대를 확인합니다. 이미 검증된 파일도 현재 양쪽 해시를 다시 읽어 확인하지만, 일치하면 **rsync로 다시 복사하지 않습니다**. 전송 완료 후 DB 기록 전에 중단된 파일도 전체 해시가 일치하면 검증 완료로 복구합니다. 따라서 재개 중 읽기 IO는 발생합니다.
+```sh
+migraflow cutover-check --job FINAL_PLAN_ID \
+  --source-freeze source-freeze-reference \
+  --destination-freeze destination-freeze-reference \
+  --backup rollback-snapshot-reference \
+  --approval approval-reference \
+  --metadata-review metadata-review-reference \
+  --extras-review retained-extras-reference --json
+```
 
-대상에서 변조·누락된 작업 소유 파일은 재전송합니다. 원본이 바뀌면 기존 계획의 재개를 중지하고 새 plan을 요구합니다. 같은 계획이 만든 것으로 확인된 파일의 복구 교체는 허용하지만, 출처가 불확실한 기존 대상 파일은 --overwrite 없이 교체하지 않습니다. 최초 --overwrite 승인 범위는 같은 계획의 재개에 유지됩니다.
+참조값은 운영자가 확인한 동결·백업·승인·메타데이터 검토 증빙으로 바꿉니다. `--extras-review`는 대상 추가 항목이 있을 때 필요합니다. 추가 항목 전체는 DB에 기록하고 출력에는 최대 20개를 표시합니다.
 
-rsync 부분 파일은 대상 각 디렉터리의 .migraflow-partial-PLAN_ID에 보존하고 다음 전송의 basis로 사용합니다. 완료 후 rsync가 사용한 부분 파일을 정리합니다. 부분 파일을 완료된 데이터로 판정하지 않고 최종 전체 해시 검증을 요구합니다. 중단된 작업을 재개할 때 상태 DB와 부분 파일을 지우지 마세요.
+`READY`는 기록한 점검 조건을 충족했다는 뜻입니다. 외부 증빙의 진위나 실제 동결을 인증하지 않으며 **서비스 전환과 삭제를 실행하지 않습니다**. 운영 담당자가 최종 전환과 원복 절차를 수행해야 합니다.
 
-감시 프로세스는 부모 프로그램의 연결이 끊기면 rsync 프로세스 그룹을 정리합니다. Windows에서는 WSL 안에도 감시 프로세스를 두어 Linux rsync를 정리합니다. worker.lock이 해제되기 전에는 다른 전송을 시작하지 않습니다. 이전 감시 프로세스가 응답하지 않으면 재개를 차단하며, 잠금 파일을 삭제해 강제로 우회하지 않습니다.
+## 데이터 안전과 제한
 
-자동 재시도 설정은 다음과 같습니다.
+- **소스 보호:** 원본 내용·mtime·권한을 변경하지 않습니다. 조회에 따른 atime 영향은 OS 정책에 따릅니다.
+- **쓰기 시험:** 기본 `preflight`와 `plan`은 데이터에 쓰지 않습니다. `preflight --test-destination-write`만 목적지에 고유 임시 파일을 기록·동기화·삭제합니다. 대상 디렉터리 mtime는 바뀔 수 있고 강제 종료 시 시험 파일이 남을 수 있습니다.
+- **덮어쓰기와 삭제:** 기존 파일 교체는 계획·복구 수단 확인 후 `--overwrite`로 허용합니다. 같은 계획이 만든 파일의 재개 복구는 소유 증거를 확인합니다. 소스 자동 삭제와 대상 삭제 동기화는 수행하지 않습니다.
+- **경로 격리:** 동일·중첩 경로, symlink/junction, 중첩 마운트와 데이터 내부 상태 저장을 차단합니다. 네트워크 공유를 `local`로 지정해 마운트 검사를 우회할 수 없습니다.
+- **상태 보존:** DB는 `state_dir/migraflow.sqlite3`, 전송 로그·매니페스트는 `state_dir/transfer-PLAN_ID`에 저장합니다. DB/WAL은 로컬 디스크에 유지하고 비밀을 설정·로그·Git에 넣지 않습니다.
+- **완료의 의미:** `PLANNED`는 목록 생성 완료, `VERIFIED`는 해당 계획의 검증 완료입니다. 서비스 전환 완료를 뜻하지 않습니다. 일관된 스냅샷 또는 최종 쓰기 동결이 별도로 필요합니다.
+- **파일 호환성:** 링크·특수 파일과 파일/디렉터리·대소문자·Unicode 정규화 충돌은 차단합니다. NAS 고유/Windows ACL, 파일명·시간 정밀도와 적대적인 동시 경로 교체에 대한 호환성·보호 범위는 별도 검토 대상입니다.
 
-~~~yaml
-retry:
-  max_attempts: 3
-  initial_delay_seconds: 1
-  max_delay_seconds: 30
-~~~
-
-max_attempts는 최초 시도를 포함합니다. 기본값에서는 일시 오류 시 1초·2초 대기 후 다시 시도합니다. max_attempts는 1~10, 대기 시간은 0~30초이며 initial_delay_seconds는 max_delay_seconds 이하입니다. 재시도 정책만 바꾸는 것은 새 계획을 요구하지 않습니다.
-
-자동 재시도는 rsync의 socket/protocol-stream/timeout 오류(10·12·30·35)와 명확한 일시 OS IO 오류, 일시적인 해시 읽기 오류에 적용합니다. 권한 거부·공간 부족·경로/설정 문제·원본 사라짐·해시 불일치와 원인이 불명확한 partial-transfer 오류(23)는 자동 재시도하지 않습니다. 제한에 도달하면 실패로 기록하고 운영자가 원인을 해결한 후 resume합니다. 수동 resume은 새 시도 예산을 시작하며 이전 실패/대기 이력은 보존합니다.
-
-status/JSON의 retry_count는 누적 재시도 수, reused_files는 가장 최근 재개에서 복사 없이 재사용한 파일 수, verified_files는 현재 검증 완료 건수입니다. 실행 상태에 RECOVERING과 RETRY_WAIT가 추가되었습니다.
-
-현재 재개는 전송·검증만 지원하며 불완전 스캔은 새 plan이 필요합니다. 이 버전 이전에 감시 장치 없이 강제 종료된 legacy 작업은 남은 프로세스의 안전한 종료를 입증할 수 없어 재개를 차단합니다. 이전 프로세스를 확인한 후 새 계획으로 진행하세요. 저장된 legacy 완료 파일의 해시는 DB 업그레이드 후 재사용할 수 있습니다.
-
-## Rich 실시간 화면
-
-run·resume·verify를 대화형 터미널에서 실행하면 Rich 화면을 자동으로 표시합니다. 진행 막대, 작업/경로/해시 알고리즘, 현재 단계의 파일·내용량, 검증 체크포인트, 현재 해시를 읽는 파일과 바이트, 단계 평균 파일 처리 속도·ETA, rsync 배치 참고 수치, 재사용·재시도·오류 수와 마지막 상태 커밋을 갱신합니다. 화면은 약 4회/초 갱신하며 데이터가 없는 구간은 미확정 또는 측정 대기로 표시합니다.
-
-~~~powershell
-migraflow run --job PLAN_ID --allow-unprotected-source
-migraflow resume --job PLAN_ID --live --allow-unprotected-source
-migraflow verify --job PLAN_ID --live
-migraflow run --job PLAN_ID --no-live --allow-unprotected-source
-~~~
-
---live는 대화형 터미널에서 화면을 명시적으로 켜고 --no-live는 끕니다. 위 소스 보호 예외는 격리된 개발 데이터 전용입니다. Linux NAS 소스는 read-only 마운트를 사용하고 예외 옵션을 생략합니다. JSON 출력이나 stderr가 터미널이 아닌 경우에는 자동 화면을 끕니다. --live와 --json 조합 또는 비대화형 --live는 설정 오류로 거부합니다. 리다이렉션/자동화에는 --no-live 또는 --json을 사용합니다.
-
-~~~powershell
-migraflow resume --job PLAN_ID --allow-unprotected-source --json
-~~~
-
-전송 성공 파일 수는 배치 결과로 확인하며 검증 체크포인트는 DB 커밋 후 반영합니다. 단계 막대는 현재 단계의 처리 진행이며 실패한 검사도 처리 건수에 포함됩니다. 체크포인트가 100%여도 재개 시 양측 해시를 다시 읽고 마지막 전체 검증을 수행합니다. 최종 VERIFIED/VERIFY_FAILED 등 결과가 완료 판단의 근거이며 실시간 수치는 cutover 승인이 아닙니다.
-
-rsync 실행 중에는 [rsync progress2](https://download.samba.org/pub/rsync/rsync.1.html)의 바이트·백분율·속도·표시 시간을 **배치 참고 수치**로 보여 줍니다. 전송 중 시간값은 남은 시간이고 rsync 완료 행은 경과 시간을 표시할 수 있습니다. 이는 실제 네트워크 바이트나 파일별 성공을 보증하지 않습니다. 재시도하면 해당 배치 수치는 초기화하며 알 수 없는 출력은 무시합니다. 해시 속도는 현재 파일의 실제 읽기 바이트 기준이고 단계 ETA는 현재 단계의 파일 처리 평균에 따른 추정입니다. 파일 크기 편차·NAS 대기·재시도 때문에 전체 작업 완료 시간과 다를 수 있습니다.
-
-화면은 stderr에 표시하고 종료 시 정리한 뒤 기존 최종 요약을 stdout에 출력합니다. Ctrl+C는 화면만 닫는 것이 아니라 해당 작업을 중단하고 INTERRUPTED 상태를 기록합니다. 같은 계획 ID로 resume하세요. 별도 status 감시 화면, 스캔 화면, 키보드 메뉴, 백그라운드 작업 분리는 아직 제공하지 않습니다. 화면 이벤트는 메모리에만 유지하고 DB를 반복 전체 조회하거나 상태를 변경하지 않습니다.
-
-## 검증 알고리즘 설정
-
-내용 검증 알고리즘의 기본값은 SHA-256이다. MD5를 선택하려면 YAML에 다음 항목을 추가한다.
-
-~~~yaml
-verification:
-  algorithm: md5
-~~~
-
-허용 값은 sha256과 md5다. verification 또는 algorithm을 생략하면 sha256을 사용한다. 선택값은 preflight, plan, status의 hash_algorithm에 표시하고 계획에 저장한다. 기존 계획 조회는 현재 설정이 아닌 저장 당시의 알고리즘을 보여 준다. 알고리즘 설정이 없던 과거 계획은 당시 기본값인 sha256으로 표시한다.
-
-run과 verify가 선택한 알고리즘으로 실제 파일 내용을 1MiB 청크로 읽어 비교한다. 알고리즘과 양쪽 해시·검증 상태를 파일별로 SQLite에 기록한다. MD5 선택 시 충돌 저항성이 SHA-256보다 약하다는 경고를 표시한다. 내부 설정 fingerprint는 내용 검증 알고리즘과 별개로 항상 SHA-256을 사용한다.
-
-## 명령어만 사용하거나 설정 덮어쓰기
-
-설정 파일 없이도 실행할 수 있습니다.
-
-~~~powershell
-migraflow plan --source 'C:\data\source' --destination 'D:\data\destination' --state-dir state
-~~~
-
-파일이 있으면 명령어 옵션이 우선합니다.
-
-~~~powershell
-migraflow plan --config migration.local.yml --destination 'D:\another-destination'
-migraflow status --state-dir state --json
-~~~
-
-우선순위는 명령어 옵션 → YAML → 기본값입니다. 명령어의 상대 경로는 현재 작업 폴더 기준입니다. CLI 진입점 대신 python -m migraflow도 사용할 수 있습니다.
-
-## 지원 타입과 안전 규칙
-
-출발지와 목적지는 독립적으로 local 또는 mounted를 지정합니다. local은 실행 인스턴스의 경로입니다. mounted는 Linux에 마운트한 원격 NAS이며 mount_source에 예상 공유 정체성을 필수로 적습니다. 예: nas-source:/export/data. 마운트 없는 SSH push/pull은 다음 단계입니다.
-
-| Linux 전송·재개·검증 조합 | 타입 |
+| 종료 코드 | 의미 |
 |---|---|
-| 로컬 → 로컬 | local → local |
-| 로컬 → NAS | local → mounted |
-| NAS → 로컬 | mounted → local |
-| NAS → NAS | mounted → mounted |
+| `0` | 성공 |
+| `1` | 실행 실패, `BLOCKED` 또는 불완전 작업 |
+| `2` | 설정·정책·사전 점검 오류 |
+| `3` | 내용·메타데이터·세대 검증 실패 |
+| `130` | 사용자 중단 |
 
-Windows Python에서는 고정 로컬 드라이브의 계획·전송·재개·검증을 지원하고 네트워크 드라이브·UNC·mounted는 차단합니다. Linux Python에서는 위 네 조합을 지원하고 예상 마운트 정체성을 확인하며 공유를 local로 지정해 마운트 검사를 우회할 수 없습니다.
+`status`도 저장된 실패 상태에 따라 비정상 종료 코드를 반환할 수 있습니다.
 
-동일·중첩 경로, symlink/junction 루트, endpoint 내부 상태 저장 위치를 거부합니다. 상태 DB는 로컬 디스크에만 저장합니다. 기본 preflight와 plan은 양쪽 데이터를 수정하지 않고 run은 대상만 수정합니다. preflight --test-destination-write는 위에서 설명한 목적지 임시 파일 쓰기 시험을 수행합니다. 원본 내용·mtime·권한은 변경하지 않습니다. 디렉터리 조회가 atime에 영향을 줄 수 있으므로 원본 접근시간 보존은 별도 마운트/스냅샷 정책이 필요합니다. 소스 read-only 보호가 확인되지 않으면 경고하며 run은 개발용 명시 옵션 없이 진행하지 않습니다. transfer_ready와 cutover_ready는 아직 운영 준비 조건 전체를 구현하지 않아 false로 유지합니다.
+## 개발 및 기여
 
-계획 상태 PLANNED는 메타데이터 스캔 완료만 뜻합니다. 같은 크기·mtime는 QUICK_MATCH_UNVERIFIED이며 해시 검증이 아닙니다. COPY_REPLACE는 --overwrite가 필요한 덮어쓰기 후보입니다. 링크·특수 파일·파일/디렉터리 충돌·대소문자/Unicode 정규화 충돌은 BLOCKED로 표시합니다. 초기 충돌 검사는 안전을 위해 대소문자를 구분하는 파일시스템에서도 보수적으로 적용합니다.
-
-현재 대상 전용 파일 목록, ACL/xattr·경로 길이·예약 이름·시간 정밀도 호환성 검사는 미구현입니다. plan은 최종 전송 또는 cutover 승인 자료를 대체하지 않습니다. source/destination/state는 실행 중 관리자가 안정적으로 유지해야 하며 적대적인 동시 경로 교체에 대한 완전한 보호는 아직 제공하지 않습니다.
-
-계획 생성마다 새 ID를 발급합니다. 중단된 스캔은 재개하지 않고 plan을 다시 실행합니다. 실패·중단 상태를 성공으로 표시하지 않습니다. 종료 코드는 0 계획/전송/조회 성공, 1 실행 실패·BLOCKED·불완전 작업, 2 설정/정책/사전 점검 실패, 3 해시·메타데이터·세대 검증 실패, 130 사용자 중지입니다. status도 저장된 실패 상태에 따라 비정상 종료 코드를 반환합니다.
-
-## 확정한 전체 목표
-
-- NAS → 중계 → NAS와 로컬/원격 모든 방향
-- Python CLI 및 Rich CUI, rsync 스트리밍 중계
-- SQLite WAL, 체크포인트·제한 재시도·재개
-- 내용 해시 검증(기본 SHA-256, 선택 MD5), 증분 동기화, 모니터링
-- 100만~1000만 파일, 총 데이터 10TB 미만
-- 소스 무변경, 삭제 기본 비활성화, 단계별 프로토콜 확장, 안전한 cutover
-
-이전은 복사·동기화를 의미하며 복사 후 원본 자동 삭제는 포함하지 않습니다. Windows에서의 실제 전송은 WSL rsync를 통해 수행하며 Windows 네이티브 rsync 엔진은 지원하지 않습니다. NAS 운영 전송은 Linux를 우선 대상으로 합니다.
-
-## 개발 문서와 테스트
-
-- [요구사항](docs/REQUIREMENTS.md)
-- [아키텍처](docs/ARCHITECTURE.md)
-- [개발 계획](docs/DEVELOPMENT.md)
-- [개발 에이전트 규칙](AGENTS.md)
-
-~~~powershell
+```sh
+python -m pip install -e ".[dev]"
 python -m pytest -q
-~~~
+```
 
-확정 요구사항, 제안, 구현 완료, 검증 완료를 문서에서 구분합니다. 이전 ChatGPT 설계 본문은 조회 시 참조 표시만 반환되어 복구하지 못했으며, 요구사항 근거는 이 프로젝트에서 받은 사용자 요청입니다. 환경 조사 항목은 NAS 제품·프로토콜·메타데이터·스냅샷·대상 기존 데이터·중단 시간·담당자·라이선스입니다.
+전송 통합 테스트에는 실제 rsync가 필요합니다. 플랫폼 전용 검사와 필요한 의존성이 설치되지 않은 통합 검사는 건너뛸 수 있습니다. SSH 시험 서버 준비 방법은 [SSH 가이드](docs/SSH.md#검증과-남은-범위)를 참고하세요. 실제 NAS·WAN·대규모 수용 시험은 로컬 테스트와 구분합니다.
 
-기술 근거: [rsync 매뉴얼](https://download.samba.org/pub/rsync/rsync.1.html), [SQLite WAL](https://www.sqlite.org/wal.html), [PyYAML 문서](https://pyyaml.org/wiki/PyYAMLDocumentation). 실제 NAS 호환성과 성능은 별도 검증이 필요합니다.
+문제 보고에는 OS, Python·rsync 버전, 전송 조합, 재현 명령과 비밀을 제거한 오류 출력을 포함해 주세요. 변경할 때에는 소스 무변경·재개·검증 계약을 유지하고 관련 문서와 필요한 회귀 검사를 함께 갱신합니다. 자세한 절차는 [개발 가이드](docs/DEVELOPMENT.md)를 따릅니다.
+
+## 문서
+
+| 문서 | 내용 |
+|---|---|
+| [요구사항](docs/REQUIREMENTS.md) | 범위와 수용 기준 |
+| [아키텍처](docs/ARCHITECTURE.md) | 전송·상태관리·검증 설계 |
+| [개발 및 운영](docs/DEVELOPMENT.md) | 개발 절차, 검증 기록, 운영·원복 절차 |
+| [SSH 전송](docs/SSH.md) | 원격 접속과 push/pull 가이드 |
+| [NAS 수용 시험](docs/NAS_TESTING.md) | 실제 NAS 환경의 시험 절차 |
+| [성능 측정](docs/PERFORMANCE.md) | 측정 조건·결과와 미검증 범위 |
+| [에이전트 작업 규칙](AGENTS.md) | 코드·문서 변경 시 적용하는 규칙 |
+
+## 라이선스
+
+라이선스는 아직 미정이며 저장소에 `LICENSE` 파일이 추가되지 않았습니다.

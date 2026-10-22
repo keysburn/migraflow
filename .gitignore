@@ -25,6 +25,8 @@ dist/
 migration.local.toml
 migration.local.yml
 migration.local.yaml
+migration.*.local.yml
+migration.*.local.yaml
 
 # MigraFlow runtime data (DB, WAL, checkpoints and reports)
 /state/

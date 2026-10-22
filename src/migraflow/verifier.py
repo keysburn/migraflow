@@ -5,6 +5,7 @@ import stat
 from .config import ConfigError
 from .preflight import _no_links
 from .progress import emit
+from .ssh import RemotePath
 
 
 class VerificationError(ValueError):
@@ -16,7 +17,8 @@ def generation(info):
 
 
 def file_generation(path):
-    _no_links(path)
+    if not isinstance(path, RemotePath):
+        _no_links(path)
     info = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode):
         raise VerificationError(f"Expected a regular file: {path}")
@@ -24,7 +26,11 @@ def file_generation(path):
 
 
 def hash_file(path, algorithm, expected=None):
-    _no_links(path)
+    if isinstance(path, RemotePath):
+        emit("hash_start", path=path, size=None)
+        digest, identity = path.call("hash", algorithm=algorithm, expected=expected)
+        emit("hash_end")
+        return digest, identity
     identity = file_generation(path)
     if expected is not None and identity != expected:
         raise VerificationError(f"Source generation changed: {path}")

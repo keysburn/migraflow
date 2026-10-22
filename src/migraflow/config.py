@@ -1,6 +1,7 @@
 import math
+import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -31,6 +32,8 @@ class Endpoint:
     type: str
     path: Path
     mount_source: str | None = None
+    host: str | None = None
+    remote_state_dir: PurePosixPath | None = None
 
 
 @dataclass(frozen=True)
@@ -41,12 +44,22 @@ class RetryPolicy:
 
 
 @dataclass(frozen=True)
+class TimeoutPolicy:
+    transfer_idle_seconds: int = 1800
+    transfer_total_seconds: float | None = None
+    hash_idle_seconds: float = 1800
+    hash_total_seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     source: Endpoint
     destination: Endpoint
     state_dir: Path
     hash_algorithm: str = "sha256"
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    metadata_policy: str = "basic"
+    timeouts: TimeoutPolicy = field(default_factory=TimeoutPolicy)
 
 
 def _keys(value, allowed, label):
@@ -62,7 +75,8 @@ def _path(value, base, label):
 
 
 def load_config(config_path=None, *, source=None, destination=None,
-                source_type=None, destination_type=None, state_dir=None):
+                source_type=None, destination_type=None, state_dir=None, metadata_policy=None,
+                source_host=None, destination_host=None, source_remote_state_dir=None, destination_remote_state_dir=None):
     explicit = config_path is not None
     file = Path(config_path or "migration.local.yml")
     data = {}
@@ -75,7 +89,23 @@ def load_config(config_path=None, *, source=None, destination=None,
         if data is None:
             data = {}
         base = file.absolute().parent
-    _keys(data, {"source", "destination", "state_dir", "verification", "retry"}, "configuration")
+    _keys(data, {"source", "destination", "state_dir", "verification", "retry", "metadata", "timeouts"}, "configuration")
+    timeout_data = data.get("timeouts", {})
+    _keys(timeout_data, set(TimeoutPolicy.__dataclass_fields__), "timeouts")
+    timeouts = TimeoutPolicy(**timeout_data)
+    for key in TimeoutPolicy.__dataclass_fields__:
+        value = getattr(timeouts, key)
+        if value is None and key.endswith("total_seconds"):
+            continue
+        if type(value) not in (int, float) or not 0 < value <= 2147483647 or not math.isfinite(value):
+            raise ConfigError(f"timeouts.{key} must be finite and >0 up to 2147483647 seconds (total limits also accept null).")
+    if type(timeouts.transfer_idle_seconds) is not int:
+        raise ConfigError("timeouts.transfer_idle_seconds must be a positive integer.")
+    metadata = data.get("metadata", {})
+    _keys(metadata, {"policy"}, "metadata")
+    metadata_policy = metadata_policy or metadata.get("policy", "basic")
+    if metadata_policy not in ("basic", "posix"):
+        raise ConfigError("metadata.policy must be basic or posix.")
     retry = data.get("retry", {})
     _keys(retry, {"max_attempts", "initial_delay_seconds", "max_delay_seconds"}, "retry")
     policy = RetryPolicy(**retry)
@@ -92,12 +122,27 @@ def load_config(config_path=None, *, source=None, destination=None,
     if algorithm not in ("sha256", "md5"):
         raise ConfigError("verification.algorithm must be sha256 or md5.")
 
-    def endpoint(label, override_path, override_type):
+    def endpoint(label, override_path, override_type, override_host, override_remote_state):
         settings = data.get(label, {})
-        _keys(settings, {"type", "path", "mount_source"}, label)
+        _keys(settings, {"type", "path", "mount_source", "host", "remote_state_dir"}, label)
         kind = override_type or settings.get("type", "local")
-        if kind not in ("local", "mounted"):
-            raise ConfigError(f"{label}.type must be local or mounted; SSH is not implemented yet.")
+        if kind not in ("local", "mounted", "rsync_ssh"):
+            raise ConfigError(f"{label}.type must be local, mounted or rsync_ssh.")
+        if kind == "rsync_ssh":
+            host = override_host if override_host is not None else settings.get("host")
+            if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}", host):
+                raise ConfigError(f"{label}.host must be a plain OpenSSH host alias.")
+            paths = []
+            for key, value in (("path", override_path if override_path is not None else settings.get("path")),
+                               ("remote_state_dir", override_remote_state if override_remote_state is not None else settings.get("remote_state_dir"))):
+                if not isinstance(value, str) or not value.startswith("/") or "\0" in value or ".." in value.split("/"):
+                    raise ConfigError(f"{label}.{key} must be an absolute POSIX path without '..'.")
+                paths.append(PurePosixPath(value))
+            if settings.get("mount_source") is not None:
+                raise ConfigError("rsync_ssh does not accept mount_source.")
+            return Endpoint(kind, paths[0], host=host, remote_state_dir=paths[1])
+        if any(value is not None for value in (settings.get("host"), settings.get("remote_state_dir"), override_host, override_remote_state)):
+            raise ConfigError("SSH settings require rsync_ssh type.")
         path = _path(override_path if override_path is not None else settings.get("path"),
                      Path.cwd() if override_path is not None else base, f"{label}.path")
         identity = settings.get("mount_source")
@@ -107,7 +152,7 @@ def load_config(config_path=None, *, source=None, destination=None,
             raise ConfigError(f"Remove {label}.mount_source when using local type.")
         return Endpoint(kind, path, identity)
 
-    return Config(endpoint("source", source, source_type),
-                  endpoint("destination", destination, destination_type),
+    return Config(endpoint("source", source, source_type, source_host, source_remote_state_dir),
+                  endpoint("destination", destination, destination_type, destination_host, destination_remote_state_dir),
                   _path(state_dir if state_dir is not None else data.get("state_dir", "state"),
-                        Path.cwd() if state_dir is not None else base, "state_dir"), algorithm, policy)
+                        Path.cwd() if state_dir is not None else base, "state_dir"), algorithm, policy, metadata_policy, timeouts)

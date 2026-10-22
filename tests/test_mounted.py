@@ -12,6 +12,7 @@ from migraflow.preflight import mounts, preflight
 from migraflow.rsync_adapter import RsyncError, check_rsync, transfer_batch
 from migraflow.state import database
 from migraflow.transfer import execute
+from migraflow.reporting import cutover_report
 
 
 @pytest.fixture
@@ -50,6 +51,32 @@ def rsync():
     if os.name == "nt":
         pytest.skip("Mounted transfers run in Linux, including Python inside WSL.")
     return check_rsync()
+
+
+def test_readiness_reports_require_all_evidence_and_review_extras(mounted, rsync):
+    config, _, _ = mounted
+    (config.source.path / "file").write_bytes(b"contents")
+    planned = create_plan(config)
+    assert execute(config, planned["id"])["status"] == "VERIFIED"
+    import migraflow.transfer as transfer
+    evidence = dict(source_freeze="freeze-1", destination_freeze="freeze-2", backup="snapshot-1",
+                    approval="approval-1", metadata_review="ACL review-1")
+    with patch("migraflow.reporting.filesystem", side_effect=lambda path: transfer.filesystem(path)):
+        report = cutover_report(config, planned["id"], **evidence)
+        assert report["status"] == "READY", report
+        assert report["cutover_executed"] is False
+        (config.destination.path / "extra").write_bytes(b"retained")
+        report = cutover_report(config, planned["id"], **evidence)
+        assert report["status"] == "BLOCKED"
+        assert not report["checks"]["extra_entries_reviewed"]
+        report = cutover_report(config, planned["id"], extras_review="retention-1", **evidence)
+        assert report["status"] == "READY", report
+        (config.destination.path / "link").symlink_to(config.destination.path / "extra")
+        report = cutover_report(config, planned["id"], extras_review="retention-1", **evidence)
+        assert report["status"] == "BLOCKED"
+        assert report["unsupported_entries"] == 1
+    assert (config.source.path / "file").read_bytes() == b"contents"
+    assert (config.destination.path / "extra").read_bytes() == b"retained"
 
 
 @pytest.mark.parametrize("types", [("local", "mounted"), ("mounted", "local"), ("mounted", "mounted")])
@@ -252,3 +279,24 @@ def test_pinned_rsync_root_never_writes_replacement_directory(mounted, rsync):
                    guard=replace_after_worker_opens_roots, pin_roots=True)
     assert (previous / "file").read_bytes() == b"data"
     assert not list(config.destination.path.iterdir())
+
+
+@pytest.mark.parametrize("types", [("local", "mounted"), ("mounted", "local"), ("mounted", "mounted")])
+def test_mounted_incremental_round_reuses_unchanged_file(mounted, rsync, types):
+    config, records, _ = mounted
+    for label, kind in zip(("source", "destination"), types):
+        endpoint = getattr(config, label)
+        if kind == "local":
+            records[label]["fs"] = "ext4"
+            config = replace(config, **{label: Endpoint("local", endpoint.path)})
+    (config.source.path / "unchanged").write_bytes(b"same")
+    (config.source.path / "changed").write_bytes(b"old")
+    first = create_plan(config)
+    assert execute(config, first["id"])["status"] == "VERIFIED"
+    (config.source.path / "changed").write_bytes(b"updated")
+    second = create_plan(config, first["id"])
+    with patch("migraflow.transfer.transfer_batch", wraps=transfer_batch) as copy:
+        result = execute(config, second["id"], overwrite=True)
+    assert result["status"] == "VERIFIED", result
+    assert result["reused_files"] == 1
+    assert copy.call_args.args[3] == [b"changed"]

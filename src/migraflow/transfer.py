@@ -1,5 +1,4 @@
 import errno
-import hashlib
 import json
 import os
 import stat
@@ -7,13 +6,15 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .ssh import root_path, utime, remote_scope
 from .config import ConfigError
 from .locking import file_lock
-from .preflight import _no_links, config_data, endpoint_identity, filesystem, preflight
+from .metadata import validate as validate_metadata
+from .preflight import _no_links, checked_filesystem, checked_stat, compatible_plan, endpoint_identity, filesystem, preflight
 from .progress import emit, observing
 from .rsync_adapter import RsyncError, check_rsync, transfer_batch
 from .state import database, now, summary, writer_lock
-from .verifier import VerificationError, file_generation, hash_file
+from .verifier import VerificationError, file_generation, generation, hash_file
 
 
 def _identity(config, checked):
@@ -21,58 +22,64 @@ def _identity(config, checked):
     for label in ("source", "destination"):
         if endpoint_identity(getattr(config, label)) != checked[label]:
             raise ConfigError("Endpoint identity changed since planning.")
-    if config.source.path.stat().st_mtime_ns != checked.get("source_root_mtime_ns"):
+    if root_path(config, "source", checked).stat().st_mtime_ns != checked.get("source_root_mtime_ns"):
         raise VerificationError("Source root changed since planning. Create a new plan.")
 
 
 def _mount_guard(config, checked):
     for label in ("source", "destination"):
         endpoint = getattr(config, label)
-        if endpoint.type == "mounted" and filesystem(endpoint.path) != checked[label]["mount"]:
+        if endpoint.type in ("mounted", "rsync_ssh") and filesystem(root_path(config, label, checked)) != checked[label]["mount"]:
             raise ConfigError("NAS mount disappeared or changed. Restore the planned mount before resuming; remounts require a new plan.")
 
 
-def _path(root, raw, mount):
+def _entry_path(root, raw):
     relative = Path(os.fsdecode(raw))
     if relative.anchor or ".." in relative.parts:
         raise ConfigError("Invalid relative path in plan.")
-    path = root / relative
-    _no_links(path)
-    if filesystem(path) != mount:
+    return root / relative
+
+
+def _path(root, raw, mount):
+    path = _entry_path(root, raw)
+    if checked_filesystem(path) != mount:
         raise ConfigError("Entry crosses an unexpected mount.")
     return path
 
 
 def _planned_source(config, row, checked):
-    path = _path(config.source.path.resolve(), row["path"], checked["source"]["mount"])
-    info = path.stat(follow_symlinks=False)
+    path = _entry_path(root_path(config, "source", checked), row["path"])
+    try:
+        info = checked_stat(path, checked["source"]["mount"])
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise VerificationError(f"Planned source disappeared: {path}. Create a new plan.") from exc
     if row["kind"] == "file":
-        identity = file_generation(path)
-        if (info.st_size, info.st_mtime_ns) != (row["size"], row["mtime_ns"]):
+        if not stat.S_ISREG(info.st_mode):
+            raise VerificationError(f"Expected a regular file: {path}")
+        identity = generation(info)
+        if identity[2:4] != [row["size"], row["mtime_ns"]]:
             raise VerificationError(f"Source changed since planning: {path}")
+        if config.metadata_policy == "posix":
+            validate_metadata(path, row["source_metadata"])
         return identity
     if not stat.S_ISDIR(info.st_mode) or info.st_mtime_ns != row["mtime_ns"]:
         raise VerificationError(f"Source directory changed since planning: {path}")
+    if config.metadata_policy == "posix":
+        validate_metadata(path, row["source_metadata"])
     return None
 
 
-def _rows(connection, plan_id, *, directories=False):
+def _rows(connection, plan_id, *, directories=False, metadata=False):
     condition = " AND kind='directory' ORDER BY length(path) DESC" if directories else " ORDER BY path"
-    cursor = connection.execute("SELECT * FROM entries WHERE plan_id=?" + condition, (plan_id,))
+    columns = "*,(SELECT source_json FROM entry_metadata m WHERE m.plan_id=entries.plan_id AND m.path=entries.path) AS source_metadata" if metadata else "*"
+    cursor = connection.execute("SELECT " + columns + " FROM entries WHERE plan_id=?" + condition, (plan_id,))
     while batch := cursor.fetchmany(500):
         yield batch
 
 
 def _load_plan(connection, plan_id, config, checked):
     planned = summary(connection, plan_id)
-    saved = planned["config"].copy()
-    original = json.dumps(saved, sort_keys=True, ensure_ascii=True)
-    current = config_data(config)
-    # Retry scheduling can change on resume, but endpoint/hash policy cannot.
-    saved.pop("retry", None)
-    current.pop("retry", None)
-    saved.setdefault("hash_algorithm", "sha256")
-    if planned["fingerprint"] != hashlib.sha256(original.encode()).hexdigest() or saved != current:
+    if not compatible_plan(planned, config):
         raise ConfigError("Configuration differs from the saved plan. Create a new plan.")
     _identity(config, planned["preflight"])
     if checked["source"] != planned["preflight"]["source"] or checked["destination"] != planned["preflight"]["destination"]:
@@ -87,14 +94,23 @@ def _status(connection, plan_id, value, error=None):
     emit("checkpoint", time=now())
 
 
+def _invalidate_verification(connection, plan_id, error):
+    connection.execute("UPDATE file_results SET status='UNVERIFIED', source_hash=NULL, destination_hash=NULL WHERE plan_id=?", (plan_id,))
+    _status(connection, plan_id, "VERIFY_FAILED", str(error))
+    emit("checkpoint", verified=0)
+
+
 def _record(connection, plan_id, raw):
     return connection.execute("SELECT * FROM file_results WHERE plan_id=? AND path=?", (plan_id, raw)).fetchone()
 
 
 def _target(config, row, checked, overwrite):
-    target = _path(config.destination.path.resolve(), row["path"], checked["destination"]["mount"])
-    if target.exists():
-        info = target.stat(follow_symlinks=False)
+    target = _entry_path(root_path(config, "destination", checked), row["path"])
+    try:
+        info = checked_stat(target, checked["destination"]["mount"])
+    except FileNotFoundError:
+        info = None
+    if info is not None:
         if row["kind"] == "file":
             if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
                 raise ConfigError("Destination file type or hardlink is unsafe.")
@@ -130,7 +146,7 @@ def _hashes(connection, plan_id, config, row, recorded, checked, *, restore_time
     expected = json.loads(recorded["source_generation"])
     if identity != expected:
         raise VerificationError("Source generation changed. Create a new plan.")
-    source = _path(config.source.path.resolve(), row["path"], checked["source"]["mount"])
+    source = _path(root_path(config, "source", checked), row["path"], checked["source"]["mount"])
     target = _target(config, row, checked, True)
     if source_hash is None:
         source_hash, _ = _hash_with_retry(connection, plan_id, config, source, expected, checked=checked)
@@ -142,10 +158,12 @@ def _hashes(connection, plan_id, config, row, recorded, checked, *, restore_time
     if source_hash != destination_hash:
         raise VerificationError("Source/destination content hashes differ.")
     if restore_times and destination_generation[3] != row["mtime_ns"]:
-        os.utime(target, ns=(target.stat().st_atime_ns, row["mtime_ns"]))
+        utime(target, ns=(target.stat().st_atime_ns, row["mtime_ns"]))
         destination_generation = file_generation(target)
     if destination_generation[2:4] != [row["size"], row["mtime_ns"]]:
         raise VerificationError("Destination size/mtime differs from planned source.")
+    if config.metadata_policy == "posix":
+        validate_metadata(target, row["source_metadata"])
     return source_hash, destination_hash
 
 
@@ -163,10 +181,12 @@ def _verify_batch(connection, plan_id, config, checked, batch):
         recorded = _record(connection, plan_id, row["path"]) if row["kind"] == "file" else None
         try:
             _planned_source(config, row, checked)
-            target = _path(config.destination.path.resolve(), row["path"], checked["destination"]["mount"])
+            target = _path(root_path(config, "destination", checked), row["path"], checked["destination"]["mount"])
             if row["kind"] == "directory":
                 if not target.is_dir() or target.stat().st_mtime_ns != row["mtime_ns"]:
                     raise VerificationError(f"Destination directory metadata differs: {target}")
+                if config.metadata_policy == "posix":
+                    validate_metadata(target, row["source_metadata"])
                 connection.execute("DELETE FROM file_results WHERE plan_id=? AND path=?", (plan_id, row["path"]))
                 continue
             if recorded is None:
@@ -197,7 +217,7 @@ def _verify(connection, plan_id, config, checked):
                                 (plan_id,)).fetchone()
     emit("phase", phase="전체 내용 검증", total_files=totals[0], total_bytes=totals[1])
     failures = 0
-    for batch in _rows(connection, plan_id):
+    for batch in _rows(connection, plan_id, metadata=config.metadata_policy == "posix"):
         _identity(config, checked)
         failures += _verify_batch(connection, plan_id, config, checked, batch)
     _identity(config, checked)
@@ -217,7 +237,7 @@ def _recover_batch(connection, plan_id, config, checked, batch, overwrite):
                 pending.append(row)
             continue
         recorded = _record(connection, plan_id, row["path"])
-        target = _path(config.destination.path.resolve(), row["path"], checked["destination"]["mount"])
+        target = _path(root_path(config, "destination", checked), row["path"], checked["destination"]["mount"])
         if recorded is not None:
             if json.loads(recorded["source_generation"]) != identity:
                 raise VerificationError("Source generation changed. Create a new plan.")
@@ -225,7 +245,7 @@ def _recover_batch(connection, plan_id, config, checked, batch, overwrite):
             source_hash = None
             if recorded["source_hash"]:
                 source_hash, _ = _hash_with_retry(connection, plan_id, config,
-                    config.source.path.resolve() / os.fsdecode(row["path"]), identity, checked=checked)
+                    root_path(config, "source", checked) / os.fsdecode(row["path"]), identity, checked=checked)
                 if source_hash != recorded["source_hash"]:
                     raise VerificationError("Source content changed. Create a new plan.")
             if target.exists():
@@ -263,7 +283,7 @@ def _partial_paths(config, checked, row, name, *, initial=False):
     relative = Path(os.fsdecode(row["path"]))
     if name in relative.parts:
         raise ConfigError("Source collides with this job's reserved partial directory.")
-    parent = config.destination.path.resolve() / (relative.parent if row["kind"] == "file" else relative)
+    parent = root_path(config, "destination", checked) / (relative.parent if row["kind"] == "file" else relative)
     partial = parent / name
     _no_links(partial)
     if filesystem(partial) != checked["destination"]["mount"]:
@@ -274,7 +294,7 @@ def _partial_paths(config, checked, row, name, *, initial=False):
 
 
 def _transfer_with_retry(connection, plan_id, config, checked, batch, batch_id,
-                         prefix, manifest, log, overwrite, partial_name):
+                         prefix, manifest, log, overwrite, partial_name, *, force_directories=False):
     policy = config.retry
     pending = batch
     for attempt in range(1, policy.max_attempts + 1):
@@ -283,6 +303,8 @@ def _transfer_with_retry(connection, plan_id, config, checked, batch, batch_id,
              total_files=sum(row["kind"] == "file" for row in pending),
              total_bytes=sum(row["size"] for row in pending))
         pending, _ = _recover_batch(connection, plan_id, config, checked, pending, overwrite)
+        if force_directories:
+            pending = batch
         if not pending:
             return
         emit("phase", phase=f"배치 {batch_id} · rsync 전송 (시도 {attempt})",
@@ -296,10 +318,14 @@ def _transfer_with_retry(connection, plan_id, config, checked, batch, batch_id,
         connection.commit()
         try:
             mounted = config.source.type == "mounted" or config.destination.type == "mounted"
-            transfer_batch(prefix, config.source.path.resolve(), config.destination.path.resolve(),
+            extra = {"guard": lambda: _mount_guard(config, checked), "pin_roots": True} if mounted else {}
+            if config.metadata_policy == "posix":
+                extra.update(preserve_metadata=True, final_directories=force_directories)
+            extra["timeouts"] = config.timeouts
+            transfer_batch(prefix, root_path(config, "source", checked), root_path(config, "destination", checked),
                            [row["path"] for row in pending], manifest, log,
                            overwrite=overwrite, partial_dir=partial_name,
-                           **({"guard": lambda: _mount_guard(config, checked), "pin_roots": True} if mounted else {}))
+                           **extra)
         except OSError as exc:
             delay = min(policy.initial_delay_seconds * 2 ** (attempt - 1), policy.max_delay_seconds)
             again = _retryable(exc) and attempt < policy.max_attempts
@@ -320,7 +346,7 @@ def _transfer_with_retry(connection, plan_id, config, checked, batch, batch_id,
             if row["kind"] == "file":
                 target = _target(config, row, checked, True)
                 info = target.stat()
-                os.utime(target, ns=(info.st_atime_ns, row["mtime_ns"]))
+                utime(target, ns=(info.st_atime_ns, row["mtime_ns"]))
                 connection.execute("UPDATE file_results SET status='TRANSFERRED',copied=1 WHERE plan_id=? AND path=?",
                                    (plan_id, row["path"]))
         connection.execute("""INSERT INTO attempts(plan_id,batch,attempt,created_at,outcome)
@@ -355,14 +381,42 @@ def _idle_worker(state):
             time.sleep(0.1)
 
 
+def _seed_incremental(connection, plan_id, config, checked):
+    # Seed only prior verified paths. No previous hash/generation is reused as current proof.
+    for batch in _rows(connection, plan_id, metadata=config.metadata_policy == "posix"):
+        _identity(config, checked)
+        for row in batch:
+            if row["action"] not in ("INCREMENTAL_CHECK", "SOURCE_CHANGED", "RESTORE_MISSING"):
+                continue
+            if _record(connection, plan_id, row["path"]) is not None:
+                continue
+            generation = _planned_source(config, row, checked)
+            connection.execute("""INSERT INTO file_results(plan_id,path,status,algorithm,source_generation)
+                VALUES(?,?,'QUEUED',?,?)""", (plan_id, row["path"], config.hash_algorithm, json.dumps(generation)))
+        connection.commit()
+
+
+@remote_scope
 def execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False, allow_unprotected_source=False,
-            progress=None):
+            progress=None, after_verify=None):
     with observing(progress):
         return _execute(config, plan_id, verify_only=verify_only, resume=resume, overwrite=overwrite,
-                        allow_unprotected_source=allow_unprotected_source)
+                        allow_unprotected_source=allow_unprotected_source, after_verify=after_verify)
 
 
-def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False, allow_unprotected_source=False):
+def _check_inventory(connection, plan_id, config, checked, *, resume, overwrite, incremental):
+    for batch in _rows(connection, plan_id, metadata=config.metadata_policy == "posix"):
+        for row in batch:
+            _mount_guard(config, checked)
+            _planned_source(config, row, checked)
+            if not resume:
+                _target(config, row, checked, overwrite or (incremental and row["action"] in
+                        ("INCREMENTAL_CHECK", "SOURCE_CHANGED", "RESTORE_MISSING")))
+        emit("processed", files=sum(row["kind"] == "file" for row in batch),
+             bytes=sum(row["size"] for row in batch))
+
+
+def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=False, allow_unprotected_source=False, after_verify=None):
     checked = preflight(config)
     state = Path(checked["state_dir"])
     _check_state_files(state)
@@ -370,6 +424,9 @@ def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=Fals
         raise ConfigError("Create a plan before running or verifying it.")
     with writer_lock(state), database(state) as connection:
         _idle_worker(state)
+        for label in ("source", "destination"):
+            if getattr(config, label).type == "rsync_ssh":
+                root_path(config, label, checked).call("idle")
         if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise ConfigError("State database integrity check failed.")
         try:
@@ -377,9 +434,7 @@ def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=Fals
         except VerificationError as exc:
             if not verify_only and not resume:
                 raise
-            connection.execute("UPDATE file_results SET status='UNVERIFIED', source_hash=NULL, destination_hash=NULL WHERE plan_id=?", (plan_id,))
-            _status(connection, plan_id, "VERIFY_FAILED", str(exc))
-            emit("checkpoint", verified=0)
+            _invalidate_verification(connection, plan_id, exc)
             return summary(connection, plan_id)
         allowed = ("TRANSFER_COMPLETE", "VERIFIED", "VERIFY_FAILED") if verify_only else (
             "PLANNED", "RUNNING", "RECOVERING", "RETRY_WAIT", "TRANSFER_COMPLETE", "VERIFYING",
@@ -387,6 +442,7 @@ def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=Fals
         if planned["status"] not in allowed:
             raise ConfigError(f"Cannot execute plan in state {planned['status']}.")
         options = planned["preflight"].get("execution_options", {})
+        incremental = planned.get("baseline_id") is not None
         emit("init", job=plan_id, status=planned["status"], retries=planned["retry_count"],
              planned_files=planned["files"], planned_bytes=planned["bytes"], verified=planned["verified_files"],
              source=str(config.source.path), destination=str(config.destination.path), algorithm=config.hash_algorithm,
@@ -402,26 +458,30 @@ def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=Fals
                 raise ConfigError("Source read-only protection is unproven. For isolated development tests use --allow-unprotected-source.")
             prefix = check_rsync()
             emit("phase", phase="전송 전 경로·세대 점검", total_files=planned["files"], total_bytes=planned["bytes"])
-            for batch in _rows(connection, plan_id):
-                for row in batch:
-                    _mount_guard(config, checked)
-                    _planned_source(config, row, checked)
-                    if not resume:
-                        _target(config, row, checked, overwrite)
-                emit("processed", files=sum(row["kind"] == "file" for row in batch),
-                     bytes=sum(row["size"] for row in batch))
-            if not resume and checked["destination_free_bytes"] < planned["bytes"]:
+            try:
+                _check_inventory(connection, plan_id, config, checked, resume=resume,
+                                 overwrite=overwrite, incremental=incremental)
+            except VerificationError as exc:
+                _invalidate_verification(connection, plan_id, exc)
+                if not resume:
+                    raise
+                return summary(connection, plan_id)
+            if not resume and not incremental and checked["destination_free_bytes"] < planned["bytes"]:
                 raise ConfigError("Insufficient destination space for temporary transfer files.")
+        verification_done = False
         try:
             if verify_only:
                 _verify(connection, plan_id, config, checked)
+                verification_done = True
+                if after_verify is not None:
+                    return after_verify(connection, plan_id, config, checked)
                 return summary(connection, plan_id)
             options = {"overwrite": overwrite, "allow_unprotected_source": allow_unprotected_source,
                        "rsync_command": prefix, "started_at": now(), "supervisor_version": 1,
-                       "retry": asdict(config.retry), "reused_files": 0}
+                       "retry": asdict(config.retry), "timeouts": asdict(config.timeouts), "reused_files": 0}
             planned["preflight"]["execution_options"] = options
             connection.execute("UPDATE plans SET preflight=? WHERE id=?", (json.dumps(planned["preflight"]), plan_id))
-            _status(connection, plan_id, "RECOVERING" if resume else "RUNNING")
+            _status(connection, plan_id, "RECOVERING" if resume or incremental else "RUNNING")
             scratch = state / ("transfer-" + plan_id)
             _no_links(scratch)
             scratch.mkdir(exist_ok=resume)
@@ -431,10 +491,13 @@ def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=Fals
                 if path.exists() and path.stat().st_nlink > 1:
                     raise ConfigError("Transfer scratch files must not be hardlinks.")
             partial_name = ".migraflow-partial-" + plan_id
-            if resume:
-                emit("phase", phase="재개 점검 · 양측 해시 재확인", total_files=planned["files"], total_bytes=planned["bytes"])
+            if incremental:
+                _seed_incremental(connection, plan_id, config, checked)
+            if resume or incremental:
+                emit("phase", phase="증분 점검 · 양측 해시 재확인" if incremental and not resume else "재개 점검 · 양측 해시 재확인",
+                     total_files=planned["files"], total_bytes=planned["bytes"])
                 needed = 0
-                for batch in _rows(connection, plan_id):
+                for batch in _rows(connection, plan_id, metadata=config.metadata_policy == "posix"):
                     _identity(config, checked)
                     pending, reused = _recover_batch(connection, plan_id, config, checked, batch, overwrite)
                     options["reused_files"] += reused
@@ -447,7 +510,7 @@ def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=Fals
                 if checked["destination_free_bytes"] < needed:
                     raise ConfigError("Insufficient destination space for remaining files.")
             _status(connection, plan_id, "RUNNING")
-            for batch_id, batch in enumerate(_rows(connection, plan_id), 1):
+            for batch_id, batch in enumerate(_rows(connection, plan_id, metadata=config.metadata_policy == "posix"), 1):
                 _identity(config, checked)
                 pending = []
                 for row in batch:
@@ -470,26 +533,29 @@ def _execute(config, plan_id, *, verify_only=False, resume=False, overwrite=Fals
                         _transfer_with_retry(connection, plan_id, config, checked, group, batch_id,
                                              prefix, manifest, log, replace, partial_name)
             emit("phase", phase="디렉터리 메타데이터 확인", total_files=None, total_bytes=0)
-            for batch in _rows(connection, plan_id, directories=True):
+            for batch in _rows(connection, plan_id, directories=True, metadata=config.metadata_policy == "posix"):
                 _identity(config, checked)
+                if config.metadata_policy == "posix":
+                    _transfer_with_retry(connection, plan_id, config, checked, batch, -1,
+                                         prefix, manifest, log, True, partial_name, force_directories=True)
                 for row in batch:
                     _planned_source(config, row, checked)
                     target = _target(config, row, checked, True)
                     if not target.is_dir():
                         raise VerificationError("Transferred directory is missing or replaced.")
-                    os.utime(target, ns=(target.stat().st_atime_ns, row["mtime_ns"]))
+                    utime(target, ns=(target.stat().st_atime_ns, row["mtime_ns"]))
             _status(connection, plan_id, "TRANSFER_COMPLETE")
             # Reverify the saved inventory. Completed checkpoints are retained until replaced.
             _verify(connection, plan_id, config, checked)
         except KeyboardInterrupt:
             connection.rollback()
-            _status(connection, plan_id, "INTERRUPTED")
+            if not (verify_only and verification_done and after_verify is not None):
+                _status(connection, plan_id, "INTERRUPTED")
             raise
         except (OSError, ConfigError, VerificationError) as exc:
             connection.rollback()
             if isinstance(exc, VerificationError):
-                connection.execute("UPDATE file_results SET status='UNVERIFIED' WHERE plan_id=? AND status='VERIFIED'", (plan_id,))
-            _status(connection, plan_id, "VERIFY_FAILED" if isinstance(exc, VerificationError) else "FAILED", str(exc))
-            if isinstance(exc, VerificationError):
-                emit("checkpoint", verified=0)
+                _invalidate_verification(connection, plan_id, exc)
+            else:
+                _status(connection, plan_id, "FAILED", str(exc))
         return summary(connection, plan_id)

@@ -21,6 +21,36 @@ from migraflow.state import database
 from migraflow.transfer import execute
 
 
+@pytest.mark.parametrize("change", ["size", "mtime", "directory", "missing"])
+def test_resume_invalidates_verified_evidence_on_precheck_change(config, change):
+    check_rsync()
+    folder = config.source.path / "nested"
+    folder.mkdir()
+    source = folder / "file"
+    source.write_bytes(b"original")
+    job = create_plan(config)["id"]
+    assert execute(config, job, allow_unprotected_source=True)["status"] == "VERIFIED"
+    if change == "size":
+        source.write_bytes(b"different size")
+    elif change == "mtime":
+        info = source.stat()
+        os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+    elif change == "missing":
+        info = folder.stat()
+        source.unlink()
+        os.utime(folder, ns=(info.st_atime_ns, info.st_mtime_ns))
+    else:
+        info = folder.stat()
+        os.utime(folder, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+    result = execute(config, job, resume=True, allow_unprotected_source=True)
+    assert result["status"] == "VERIFY_FAILED"
+    assert result["verified_files"] == 0
+    assert (config.destination.path / "nested" / "file").read_bytes() == b"original"
+    with database(config.state_dir, readonly=True) as db:
+        row = db.execute("SELECT source_hash,destination_hash FROM file_results WHERE plan_id=?", (job,)).fetchone()
+        assert tuple(row) == (None, None)
+
+
 @pytest.fixture
 def config(tmp_path):
     source, target = tmp_path / "source", tmp_path / "destination"
